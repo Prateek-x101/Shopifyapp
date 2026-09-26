@@ -5,10 +5,10 @@ generator client {
   provider = "prisma-client-js"
 }
 
-// SQLite locally. On Render switch the provider to "postgresql" and set DATABASE_URL.
+// PostgreSQL (Render). Set DATABASE_URL, e.g. the Render Postgres "Internal Database URL".
 datasource db {
-  provider = "sqlite"
-  url      = "file:dev.sqlite"
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
 }
 
 model Session {

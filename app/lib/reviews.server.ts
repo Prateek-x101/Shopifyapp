@@ -340,7 +340,10 @@ export async function listReviews(opts: {
   if (opts.status && opts.status !== "all") where.status = opts.status;
   if (opts.rating) where.rating = opts.rating;
   if (opts.media) where.hasMedia = true;
-  if (opts.q) where.OR = [{ body: { contains: opts.q } }, { author: { contains: opts.q } }, { title: { contains: opts.q } }];
+  if (opts.q) {
+    const c = { contains: opts.q, mode: "insensitive" as const };
+    where.OR = [{ body: c }, { author: c }, { title: c }];
+  }
   const orderBy: any =
     opts.sort === "oldest" ? [{ createdAt: "asc" }] :
     opts.sort === "highest" ? [{ rating: "desc" }, { createdAt: "desc" }] :
