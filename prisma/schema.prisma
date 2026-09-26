@@ -1,0 +1,60 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// SQLite locally. On Render switch the provider to "postgresql" and set DATABASE_URL.
+datasource db {
+  provider = "sqlite"
+  url      = "file:dev.sqlite"
+}
+
+model Session {
+  id            String    @id
+  shop          String
+  state         String
+  isOnline      Boolean   @default(false)
+  scope         String?
+  expires       DateTime?
+  accessToken   String
+  userId        BigInt?
+  firstName     String?
+  lastName      String?
+  email         String?
+  accountOwner  Boolean   @default(false)
+  locale        String?
+  collaborator  Boolean?  @default(false)
+  emailVerified Boolean?  @default(false)
+  refreshToken        String?
+  refreshTokenExpires DateTime?
+}
+
+/// Fast index of reviews. The source of truth is the `vw_review` metaobject in Shopify;
+/// this table can always be rebuilt from Shopify with "Resync".
+model Review {
+  id        String   @id            // metaobject GID
+  shop      String
+  productId String                  // numeric product id
+  rating    Int
+  title     String?
+  body      String
+  author    String
+  location  String?
+  status    String                  // pending | published | hidden
+  verified  Boolean  @default(false)
+  source    String   @default("Website")
+  orderId   String?
+  images    String   @default("[]") // JSON: [{ id, url, alt }]
+  replies   String   @default("[]") // JSON: [{ id, author, text, isStore, createdAt }]
+  helpful   Int      @default(0)
+  featured  Boolean  @default(false)
+  hasMedia  Boolean  @default(false)
+  createdAt DateTime
+  updatedAt DateTime @updatedAt
+
+  @@index([shop, productId, status, createdAt])
+  @@index([shop, productId, status, rating])
+  @@index([shop, status])
+}
