@@ -12,6 +12,7 @@ import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { createReview, gql, listReviews, patchReview, publicReview, uploadImages } from "../lib/reviews.server";
+import { legacyGet, legacyPost } from "../lib/legacy-proxy.server";
 
 const json = (data: unknown, init: ResponseInit = {}) =>
   new Response(JSON.stringify(data), {
@@ -34,6 +35,9 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   if (!session) return json({ error: "App not installed" }, { status: 401 });
   const path = params["*"] || "";
   const sp = new URL(request.url).searchParams;
+
+  // storefront review widget: /apps/engine?action=...
+  if (!path && sp.get("action")) return legacyGet(session.shop, sp);
 
   if (path === "reviews") {
     const productId = (sp.get("product") || "").replace(/\D/g, "");
@@ -80,6 +84,17 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
   const sp = new URL(request.url).searchParams;
   const customerId = sp.get("logged_in_customer_id") || "";
   const ip = request.headers.get("x-forwarded-for")?.split(",")[0].trim() || "anon";
+
+  // storefront review widget: POST /apps/engine with a JSON body { actionType, ... }
+  if (!path) {
+    let body: any = {};
+    try { body = await request.json(); } catch { return json({ success: false, error: "Invalid request" }, { status: 400 }); }
+    try {
+      return await legacyPost(admin, session.shop, sp, body, ip);
+    } catch (e: any) {
+      return json({ success: false, error: e?.message || "Something went wrong" }, { status: 500 });
+    }
+  }
 
   if (path === "helpful") {
     const fd = await request.formData();

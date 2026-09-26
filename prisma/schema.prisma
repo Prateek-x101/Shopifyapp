@@ -58,3 +58,17 @@ model Review {
   @@index([shop, productId, status, rating])
   @@index([shop, status])
 }
+
+/// Who marked what as helpful / liked (one vote per customer per target).
+model Vote {
+  id         String   @id @default(cuid())
+  shop       String
+  reviewId   String                 // metaobject GID of the review
+  targetId   String                 // review id, comment id or reply id
+  customerId String
+  kind       String                 // "helpful" (review) | "like" (comment/reply)
+  createdAt  DateTime @default(now())
+
+  @@unique([targetId, customerId, kind])
+  @@index([reviewId])
+}

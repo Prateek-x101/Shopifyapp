@@ -10,14 +10,16 @@ import prisma from "../db.server";
 export const REVIEW_TYPE = "vw_review";
 export const SUMMARY_NS = "vw_reviews";
 export const SUMMARY_KEY = "summary";
-import { SOURCES, STATUSES } from "./reviews.shared";
-export { SOURCES, STATUSES };
+import { SOURCES, STATUSES, countComments, normalizeComments } from "./reviews.shared";
+import type { ReviewComment } from "./reviews.shared";
+export { SOURCES, STATUSES, countComments, normalizeComments };
+export type { ReviewComment };
 const TOP_IN_SUMMARY = 6;
 
 type Admin = { graphql: (q: string, o?: { variables?: Record<string, unknown> }) => Promise<Response> };
 
 export type ReviewImage = { id: string; url: string; alt?: string };
-export type ReviewReply = { id: string; author: string; text: string; isStore: boolean; createdAt: string };
+export type ReviewReply = ReviewComment;
 export type ReviewInput = {
   productId: string;
   rating: number;
@@ -130,8 +132,8 @@ function fromMetaobject(shop: string, m: any) {
   const imgs: ReviewImage[] = (get("images")?.references?.nodes || [])
     .filter((n: any) => n?.image?.url)
     .map((n: any) => ({ id: n.id, url: n.image.url, alt: n.alt || "" }));
-  let replies: ReviewReply[] = [];
-  try { replies = JSON.parse(val("replies") || "[]") || []; } catch { replies = []; }
+  let replies: ReviewComment[] = [];
+  try { replies = normalizeComments(JSON.parse(val("replies") || "[]")); } catch { replies = []; }
   return {
     id: m.id as string,
     shop,
@@ -232,15 +234,227 @@ export async function recomputeSummary(admin: Admin, shop: string, productId: st
     updated: new Date().toISOString(),
     top: top.map(publicReview),
   };
+  // Same data in the format of the storefront review widget (engine-review-widget):
+  // engine_review.summary_v2 = { total_count, avg_rating, star_counts, preview_reviews, page_count }
+  const preview = await prisma.review.findMany({
+    where,
+    orderBy: [{ featured: "desc" }, { hasMedia: "desc" }, { createdAt: "desc" }],
+    take: LEGACY_PREVIEW,
+  });
+  const helpfulMap = await helpfulIdsFor(preview.map((r) => r.id));
+  const legacy = {
+    total_count: agg._count,
+    avg_rating: summary.avg,
+    star_counts: dist,
+    photo_count: photos,
+    page_count: 0, // the widget loads the rest page by page from the app proxy
+    preview_reviews: preview.map((r) => legacyReview(r, helpfulMap[r.id] || [])),
+    updated_at: summary.updated,
+  };
   await gql(admin, `mutation($m: [MetafieldsSetInput!]!) { metafieldsSet(metafields: $m) { userErrors { message } } }`, {
-    m: [{ ownerId: productGid(productId), namespace: SUMMARY_NS, key: SUMMARY_KEY, type: "json", value: JSON.stringify(summary) }],
+    m: [
+      { ownerId: productGid(productId), namespace: SUMMARY_NS, key: SUMMARY_KEY, type: "json", value: JSON.stringify(summary) },
+      { ownerId: productGid(productId), namespace: LEGACY_NS, key: LEGACY_KEY, type: "json", value: JSON.stringify(legacy) },
+    ],
   });
   return summary;
 }
 
+/* ───────────────────────── storefront widget format ───────────────────────── */
+export const LEGACY_NS = "engine_review";
+export const LEGACY_KEY = "summary_v2"; // v1 holds the old generated data and is left untouched
+const LEGACY_PREVIEW = 10;
+
+export async function helpfulIdsFor(reviewIds: string[]) {
+  const map: Record<string, string[]> = {};
+  if (!reviewIds.length) return map;
+  const votes = await prisma.vote.findMany({
+    where: { reviewId: { in: reviewIds }, kind: "helpful" },
+    select: { reviewId: true, customerId: true },
+  });
+  votes.forEach((v) => (map[v.reviewId] ||= []).push(v.customerId));
+  return map;
+}
+
+async function likedIdsFor(reviewIds: string[]) {
+  const map: Record<string, string[]> = {};
+  if (!reviewIds.length) return map;
+  const votes = await prisma.vote.findMany({
+    where: { reviewId: { in: reviewIds }, kind: "like" },
+    select: { targetId: true, customerId: true },
+  });
+  votes.forEach((v) => (map[v.targetId] ||= []).push(v.customerId));
+  return map;
+}
+
+/** A review in the shape the storefront widget renders (name, text, comments[], helpfulCount…). */
+export function legacyReview(r: any, helpfulByCustomerIds: string[] = [], likedBy: Record<string, string[]> = {}) {
+  const images: ReviewImage[] = typeof r.images === "string" ? JSON.parse(r.images) : r.images || [];
+  const comments = normalizeComments(typeof r.replies === "string" ? JSON.parse(r.replies) : r.replies || []);
+  const mapC = (c: ReviewComment): any => ({
+    id: c.id,
+    name: c.name,
+    text: c.text,
+    date: c.date,
+    type: c.type,
+    status: c.status,
+    verified: !!c.verified,
+    likeCount: c.likeCount,
+    likedByCustomerIds: likedBy[c.id] || [],
+    parentCommentId: c.parentCommentId || null,
+    replies: (c.replies || []).map(mapC),
+  });
+  return {
+    id: String(r.id).split("/").pop(),
+    productId: `gid://shopify/Product/${r.productId}`,
+    name: r.author,
+    title: r.title || "",
+    text: r.body,
+    rating: r.rating,
+    date: new Date(r.createdAt).toISOString(),
+    location: r.location || "",
+    verified: !!r.verified,
+    status: "approved",
+    sentiment: r.rating >= 4 ? "positive" : r.rating === 3 ? "neutral" : "negative",
+    helpfulCount: r.helpful,
+    likeCount: r.helpful,
+    helpfulByCustomerIds,
+    images: images.filter((i) => i.url).map((i) => i.url),
+    videos: [],
+    comments: comments.map(mapC),
+  };
+}
+
+/** Page of reviews for the widget. Page 1 = first 250, page N>1 = 10 reviews from (N-1)*10 (the widget's paging). */
+export async function legacyPage(shop: string, productId: string, page: number) {
+  const where = { shop, productId, status: "published" };
+  const take = page <= 1 ? 250 : 10;
+  const skip = page <= 1 ? 0 : (page - 1) * 10;
+  const [total, rows] = await Promise.all([
+    prisma.review.count({ where }),
+    prisma.review.findMany({ where, orderBy: [{ featured: "desc" }, { createdAt: "desc" }], skip, take }),
+  ]);
+  const ids = rows.map((r) => r.id);
+  const [helpful, liked] = await Promise.all([helpfulIdsFor(ids), likedIdsFor(ids)]);
+  return {
+    success: true,
+    reviews: rows.map((r) => legacyReview(r, helpful[r.id] || [], liked)),
+    count: rows.length,
+    totalCount: total,
+    pageCount: Math.max(1, Math.ceil(total / 10)),
+    hasMore: skip + rows.length < total,
+  };
+}
+
+/* ───────────────────────── comments, replies, votes ───────────────────────── */
+function findNode(list: ReviewComment[], id: string): ReviewComment | null {
+  for (const c of list) {
+    if (c.id === id) return c;
+    const hit = findNode(c.replies || [], id);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+function removeNode(list: ReviewComment[], id: string): boolean {
+  const i = list.findIndex((c) => c.id === id);
+  if (i >= 0) {
+    list.splice(i, 1);
+    return true;
+  }
+  return list.some((c) => removeNode(c.replies || [], id));
+}
+
+/** Add a comment on a review (parentId = null) or a reply under a comment/reply. */
+export async function addComment(
+  admin: Admin,
+  shop: string,
+  reviewId: string,
+  input: { name: string; text: string; type: "store" | "customer"; customerId?: string | null; verified?: boolean; id?: string },
+  parentId: string | null = null,
+) {
+  const cur = await prisma.review.findUnique({ where: { id: reviewId } });
+  if (!cur || cur.shop !== shop) throw new Error("Review not found");
+  const tree = normalizeComments(JSON.parse(cur.replies));
+  const safeId = input.id && /^[A-Za-z0-9_-]{3,40}$/.test(input.id) && !findNode(tree, input.id) ? input.id : null;
+  const node: ReviewComment = {
+    id: safeId || `c_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
+    name: input.name.slice(0, 60),
+    text: input.text.slice(0, 2000),
+    date: new Date().toISOString(),
+    type: input.type,
+    status: "approved",
+    customerId: input.customerId || null,
+    verified: !!input.verified,
+    likeCount: 0,
+    parentCommentId: parentId,
+    replies: [],
+  };
+  if (parentId) {
+    const parent = findNode(tree, parentId);
+    if (!parent) throw new Error("Comment not found");
+    (parent.replies ||= []).push(node);
+  } else {
+    tree.push(node);
+  }
+  await patchReview(admin, shop, reviewId, { replies: tree });
+  return node;
+}
+
+export async function removeComment(admin: Admin, shop: string, reviewId: string, commentId: string) {
+  const cur = await prisma.review.findUnique({ where: { id: reviewId } });
+  if (!cur || cur.shop !== shop) throw new Error("Review not found");
+  const tree = normalizeComments(JSON.parse(cur.replies));
+  removeNode(tree, commentId);
+  await prisma.vote.deleteMany({ where: { targetId: commentId } });
+  await patchReview(admin, shop, reviewId, { replies: tree });
+}
+
+/** Helpful on a review: one vote per customer, can be undone. */
+export async function setHelpful(admin: Admin, shop: string, reviewId: string, customerId: string, liked: boolean) {
+  const cur = await prisma.review.findUnique({ where: { id: reviewId } });
+  if (!cur || cur.shop !== shop || cur.status !== "published") throw new Error("Review not found");
+  if (liked) {
+    await prisma.vote.upsert({
+      where: { targetId_customerId_kind: { targetId: reviewId, customerId, kind: "helpful" } },
+      create: { shop, reviewId, targetId: reviewId, customerId, kind: "helpful" },
+      update: {},
+    });
+  } else {
+    await prisma.vote.deleteMany({ where: { targetId: reviewId, customerId, kind: "helpful" } });
+  }
+  const count = await prisma.vote.count({ where: { targetId: reviewId, kind: "helpful" } });
+  if (count !== cur.helpful) await patchReview(admin, shop, reviewId, { helpful: count });
+  return { liked, helpfulCount: count };
+}
+
+/** Like on a comment or reply. */
+export async function setThreadLike(admin: Admin, shop: string, reviewId: string, targetId: string, customerId: string, liked: boolean) {
+  const cur = await prisma.review.findUnique({ where: { id: reviewId } });
+  if (!cur || cur.shop !== shop) throw new Error("Review not found");
+  const tree = normalizeComments(JSON.parse(cur.replies));
+  const node = findNode(tree, targetId);
+  if (!node) throw new Error("Comment not found");
+  if (liked) {
+    await prisma.vote.upsert({
+      where: { targetId_customerId_kind: { targetId, customerId, kind: "like" } },
+      create: { shop, reviewId, targetId, customerId, kind: "like" },
+      update: {},
+    });
+  } else {
+    await prisma.vote.deleteMany({ where: { targetId, customerId, kind: "like" } });
+  }
+  const count = await prisma.vote.count({ where: { targetId, kind: "like" } });
+  if (node.likeCount !== count) {
+    node.likeCount = count;
+    await patchReview(admin, shop, reviewId, { replies: tree });
+  }
+  return { liked, likeCount: count };
+}
+
 /** Shape sent to the storefront: no order ids, no internal fields. */
 export function publicReview(r: any) {
-  const replies: ReviewReply[] = typeof r.replies === "string" ? JSON.parse(r.replies) : r.replies || [];
+  const replies = normalizeComments(typeof r.replies === "string" ? JSON.parse(r.replies) : r.replies || []);
   const images: ReviewImage[] = typeof r.images === "string" ? JSON.parse(r.images) : r.images || [];
   return {
     id: r.id.split("/").pop(),
@@ -251,7 +465,7 @@ export function publicReview(r: any) {
     location: r.location || "",
     verified: r.verified,
     images: images.map((i) => ({ url: i.url, alt: i.alt || "" })),
-    replies: replies.map((x) => ({ author: x.author, text: x.text, isStore: x.isStore, createdAt: x.createdAt })),
+    replies: replies.filter((x) => x.status === "approved").map((x) => ({ author: x.name, text: x.text, isStore: x.type === "store", createdAt: x.date })),
     helpful: r.helpful,
     date: new Date(r.createdAt).toISOString(),
   };

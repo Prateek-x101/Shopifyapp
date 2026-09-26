@@ -6,6 +6,7 @@ import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { deleteReview, gql, listReviews, patchReview } from "../lib/reviews.server";
+import { countComments, normalizeComments } from "../lib/reviews.shared";
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
@@ -55,7 +56,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
         source: r.source,
         featured: r.featured,
         images: JSON.parse(r.images) as { url: string }[],
-        replies: (JSON.parse(r.replies) as any[]).length,
+        replies: countComments(normalizeComments(JSON.parse(r.replies))),
         createdAt: r.createdAt.toISOString(),
       })),
     },

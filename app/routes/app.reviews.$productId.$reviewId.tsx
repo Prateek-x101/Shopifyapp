@@ -1,20 +1,22 @@
 import type { ActionFunctionArgs, HeadersFunction, LoaderFunctionArgs } from "react-router";
 import { Form, useActionData, useFetcher, useLoaderData, useNavigation } from "react-router";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
-import { SOURCES } from "../lib/reviews.shared";
+import { SOURCES, countComments, normalizeComments } from "../lib/reviews.shared";
 import {
+  addComment,
   createReview,
   deleteReview,
   gql,
-  patchReview,
+  removeComment,
   updateReview,
   uploadImages,
 } from "../lib/reviews.server";
-import type { ReviewImage, ReviewReply } from "../lib/reviews.server";
+import type { ReviewImage } from "../lib/reviews.server";
+import type { ReviewComment } from "../lib/reviews.shared";
 
 const gidOf = (id: string) => `gid://shopify/Metaobject/${id}`;
 
@@ -30,7 +32,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     review = {
       ...r,
       images: JSON.parse(r.images) as ReviewImage[],
-      replies: JSON.parse(r.replies) as ReviewReply[],
+      replies: normalizeComments(JSON.parse(r.replies)),
       createdAt: r.createdAt.toISOString(),
       updatedAt: r.updatedAt.toISOString(),
     };
@@ -62,22 +64,16 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     return redirect(`/app/reviews/${productId}`);
   }
 
-  if (intent === "reply-add" || intent === "reply-delete") {
-    const cur = await prisma.review.findUnique({ where: { id } });
-    if (!cur) return { error: "Review not found" };
-    let replies: ReviewReply[] = JSON.parse(cur.replies);
-    if (intent === "reply-add") {
-      const text = String(fd.get("replyText") || "").trim();
-      if (!text) return { error: "Write a reply first" };
-      replies = [
-        ...replies,
-        { id: `r_${Date.now().toString(36)}`, author: String(fd.get("replyAuthor") || "Store"), text, isStore: true, createdAt: new Date().toISOString() },
-      ];
-    } else {
-      replies = replies.filter((r) => r.id !== fd.get("replyId"));
-    }
-    await patchReview(admin, session.shop, id, { replies });
-    return { ok: true, message: intent === "reply-add" ? "Reply added" : "Reply removed" };
+  if (intent === "reply-add") {
+    const text = String(fd.get("replyText") || "").trim();
+    if (!text) return { error: "Write a reply first" };
+    const parentId = String(fd.get("parentId") || "") || null;
+    await addComment(admin, session.shop, id, { name: String(fd.get("replyAuthor") || "Store"), text, type: "store" }, parentId);
+    return { ok: true, message: parentId ? "Reply added" : "Comment added" };
+  }
+  if (intent === "reply-delete") {
+    await removeComment(admin, session.shop, id, String(fd.get("replyId") || ""));
+    return { ok: true, message: "Removed" };
   }
 
   // ── save (create / update) ──
@@ -144,6 +140,7 @@ export default function EditReview() {
   const saving = nav.state === "submitting" && nav.formData?.get("intent") !== "delete";
   const errors = data?.errors || {};
   const replyFetcher = useFetcher<typeof action>();
+  const [replyTo, setReplyTo] = useState<{ id: string; name: string } | null>(null);
 
   useEffect(() => {
     const msg = data?.message || (replyFetcher.data as any)?.message;
@@ -232,36 +229,46 @@ export default function EditReview() {
       </Form>
 
       {!isNew && (
-        <s-section heading={`Replies (${(r.replies || []).length})`}>
+        <s-section heading={`Comments and replies (${countComments(r.replies || [])})`}>
           <s-stack gap="base">
-            {(r.replies || []).map((rp: ReviewReply) => (
-              <s-box key={rp.id} padding="base" background={rp.isStore ? "subdued" : "base"} borderRadius="base" border="base">
-                <s-stack direction="inline" justifyContent="space-between" alignItems="start" gap="base">
-                  <s-stack gap="small-200">
-                    <s-stack direction="inline" gap="small-200" alignItems="center">
-                      <s-text type="strong">{rp.author}</s-text>
-                      {rp.isStore && <s-badge tone="info">Store</s-badge>}
-                      <s-text color="subdued">{new Date(rp.createdAt).toLocaleDateString("en-IN")}</s-text>
-                    </s-stack>
-                    <s-text>{rp.text}</s-text>
-                  </s-stack>
-                  <s-button
-                    variant="tertiary"
-                    tone="critical"
-                    icon="delete"
-                    accessibilityLabel="Remove reply"
-                    onClick={() => replyFetcher.submit({ intent: "reply-delete", replyId: rp.id }, { method: "POST" })}
-                  />
-                </s-stack>
-              </s-box>
+            {(r.replies || []).length === 0 && (
+              <s-text color="subdued">No comments yet. Customers can comment on this review from the product page.</s-text>
+            )}
+            {(r.replies || []).map((c: ReviewComment) => (
+              <ThreadNode
+                key={c.id}
+                node={c}
+                depth={0}
+                onReply={(n) => setReplyTo({ id: n.id, name: n.name })}
+                onDelete={(n) => {
+                  if (confirm("Remove this comment and its replies?")) replyFetcher.submit({ intent: "reply-delete", replyId: n.id }, { method: "POST" });
+                }}
+              />
             ))}
-            <replyFetcher.Form method="post">
+            <replyFetcher.Form
+              method="post"
+              onSubmit={() => setTimeout(() => setReplyTo(null), 0)}
+            >
               <input type="hidden" name="intent" value="reply-add" />
               <input type="hidden" name="replyAuthor" value={shopName} />
+              <input type="hidden" name="parentId" value={replyTo?.id || ""} />
               <s-stack gap="small-200">
-                <s-text-area label={`Reply as ${shopName}`} name="replyText" rows={3} placeholder="Thank you for the review!" />
+                {replyTo && (
+                  <s-stack direction="inline" gap="small-200" alignItems="center">
+                    <s-badge tone="info">Replying to {replyTo.name}</s-badge>
+                    <s-button variant="tertiary" onClick={() => setReplyTo(null)}>Cancel</s-button>
+                  </s-stack>
+                )}
+                <s-text-area
+                  label={replyTo ? `Reply to ${replyTo.name} as ${shopName}` : `Comment as ${shopName}`}
+                  name="replyText"
+                  rows={3}
+                  placeholder="Thank you for the review!"
+                />
                 <s-stack direction="inline" justifyContent="end">
-                  <s-button type="submit" {...(replyFetcher.state !== "idle" ? { loading: true } : {})}>Post reply</s-button>
+                  <s-button type="submit" {...(replyFetcher.state !== "idle" ? { loading: true } : {})}>
+                    {replyTo ? "Post reply" : "Post comment"}
+                  </s-button>
                 </s-stack>
               </s-stack>
             </replyFetcher.Form>
@@ -292,3 +299,43 @@ export default function EditReview() {
 }
 
 export const headers: HeadersFunction = (headersArgs) => boundary.headers(headersArgs);
+
+function ThreadNode({
+  node,
+  depth,
+  onReply,
+  onDelete,
+}: {
+  node: ReviewComment;
+  depth: number;
+  onReply: (n: ReviewComment) => void;
+  onDelete: (n: ReviewComment) => void;
+}) {
+  return (
+    <div style={{ marginLeft: depth ? 24 : 0, borderLeft: depth ? "2px solid #e3e3e3" : "none", paddingLeft: depth ? 12 : 0 }}>
+      <s-box padding="small-200" background={node.type === "store" ? "subdued" : "base"} borderRadius="base" border="base">
+        <s-stack direction="inline" justifyContent="space-between" alignItems="start" gap="base">
+          <s-stack gap="small-300">
+            <s-stack direction="inline" gap="small-200" alignItems="center">
+              <s-text type="strong">{node.name}</s-text>
+              {node.type === "store" && <s-badge tone="info">Store</s-badge>}
+              {node.verified && <s-badge tone="success">Verified</s-badge>}
+              <s-text color="subdued">{new Date(node.date).toLocaleDateString("en-IN")}</s-text>
+              {node.likeCount > 0 && <s-text color="subdued">♥ {node.likeCount}</s-text>}
+            </s-stack>
+            <s-text>{node.text}</s-text>
+          </s-stack>
+          <s-stack direction="inline" gap="small-300">
+            <s-button variant="tertiary" icon="chat" accessibilityLabel="Reply" onClick={() => onReply(node)} />
+            <s-button variant="tertiary" tone="critical" icon="delete" accessibilityLabel="Remove" onClick={() => onDelete(node)} />
+          </s-stack>
+        </s-stack>
+      </s-box>
+      {(node.replies || []).map((c) => (
+        <div key={c.id} style={{ marginTop: 8 }}>
+          <ThreadNode node={c} depth={depth + 1} onReply={onReply} onDelete={onDelete} />
+        </div>
+      ))}
+    </div>
+  );
+}
