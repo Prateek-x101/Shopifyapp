@@ -1,10 +1,10 @@
 /**
- * Storefront API behind the app proxy:  https://<store>/apps/vw/...
+ * Storefront API behind the app proxy:  https://<store>/apps/engine/...
  *
- *   GET  /apps/vw/reviews?product=123&page=2&sort=newest&rating=5&media=1   -> JSON page of published reviews
- *   POST /apps/vw/reviews   (multipart: product, rating, body, author, location, title, photos[], website=honeypot)
+ *   GET  /apps/engine/reviews?product=123&page=2&sort=newest&rating=5&media=1   -> JSON page of published reviews
+ *   POST /apps/engine/reviews   (multipart: product, rating, body, author, location, title, photos[], website=honeypot)
  *                           -> new review saved as "pending"
- *   POST /apps/vw/helpful   (review=<id>)                                   -> +1 helpful
+ *   POST /apps/engine/helpful   (review=<id>)                                   -> +1 helpful
  *
  * Shopify signs every proxied request; authenticate.public.appProxy verifies it.
  */
