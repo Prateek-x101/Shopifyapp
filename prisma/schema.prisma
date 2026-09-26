@@ -51,12 +51,16 @@ model Review {
   helpful   Int      @default(0)
   featured  Boolean  @default(false)
   hasMedia  Boolean  @default(false)
+  needsReply    Boolean   @default(false) // a comment thread ends with a customer message
+  commentCount  Int       @default(0)
+  lastCommentAt DateTime?                // latest customer comment/reply
   createdAt DateTime
   updatedAt DateTime @updatedAt
 
   @@index([shop, productId, status, createdAt])
   @@index([shop, productId, status, rating])
   @@index([shop, status])
+  @@index([shop, needsReply])
 }
 
 /// Who marked what as helpful / liked (one vote per customer per target).

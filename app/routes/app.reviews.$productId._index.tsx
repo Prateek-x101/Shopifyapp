@@ -57,6 +57,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
         featured: r.featured,
         images: JSON.parse(r.images) as { url: string }[],
         replies: countComments(normalizeComments(JSON.parse(r.replies))),
+        needsReply: r.needsReply,
         createdAt: r.createdAt.toISOString(),
       })),
     },
@@ -226,8 +227,10 @@ export default function ProductReviews() {
                     <s-text>{r.body.length > 180 ? r.body.slice(0, 180) + "…" : r.body}</s-text>
                     {(r.images.length > 0 || r.replies > 0) && (
                       <s-stack direction="inline" gap="small-200" alignItems="center">
-                        {r.images.slice(0, 4).map((img, i) => <s-thumbnail key={i} src={img.url} alt="Review photo" size="small-200" />)}
-                        {r.replies > 0 && <s-badge icon="chat">{r.replies} repl{r.replies > 1 ? "ies" : "y"}</s-badge>}
+                        {r.images.slice(0, 4).map((img, i) => <s-thumbnail key={i} src={img.url} alt="Review photo" size="base" />)}
+                        {r.images.length > 4 && <s-text color="subdued">+{r.images.length - 4}</s-text>}
+                        {r.replies > 0 && <s-badge icon="chat">{r.replies} comment{r.replies > 1 ? "s" : ""}</s-badge>}
+                        {r.needsReply && <s-badge tone="critical">Needs reply</s-badge>}
                       </s-stack>
                     )}
                   </s-stack>

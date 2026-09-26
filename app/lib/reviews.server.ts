@@ -152,8 +152,32 @@ function fromMetaobject(shop: string, m: any) {
     helpful: parseInt(val("helpful") || "0", 10),
     featured: val("featured") === "true",
     hasMedia: imgs.length > 0,
+    ...commentState(replies),
     createdAt: new Date(val("created") || m.updatedAt),
   };
+}
+
+/** needsReply: some thread's latest message is from a customer. lastCommentAt: latest customer message. */
+export function commentState(tree: ReviewComment[]) {
+  let needsReply = false;
+  let last: number | null = null;
+  let count = 0;
+  const walk = (n: ReviewComment, acc: ReviewComment[]) => {
+    acc.push(n);
+    (n.replies || []).forEach((c) => walk(c, acc));
+  };
+  for (const top of tree) {
+    const nodes: ReviewComment[] = [];
+    walk(top, nodes);
+    count += nodes.length;
+    const latest = nodes.reduce((a, b) => (Date.parse(b.date) > Date.parse(a.date) ? b : a));
+    if (latest.type === "customer") needsReply = true;
+    nodes.forEach((n) => {
+      const t = Date.parse(n.date);
+      if (n.type === "customer" && Number.isFinite(t) && (last === null || t > last)) last = t;
+    });
+  }
+  return { needsReply, commentCount: count, lastCommentAt: last === null ? null : new Date(last) };
 }
 
 async function upsertIndex(row: ReturnType<typeof fromMetaobject>) {
@@ -526,22 +550,86 @@ export async function uploadImages(admin: Admin, files: File[]): Promise<ReviewI
 }
 
 /* ───────────────────────── queries for the admin UI ───────────────────────── */
+export type ProductStat = {
+  total: number; published: number; pending: number; avg: number; sum: number;
+  needsReply: number; comments: number; lastReviewAt: string | null; lastCommentAt: string | null;
+};
+
 export async function productStats(shop: string) {
-  const rows = await prisma.review.groupBy({
-    by: ["productId", "status"],
-    where: { shop },
-    _count: true,
-    _avg: { rating: true },
-  });
-  const map: Record<string, { total: number; published: number; pending: number; avg: number; sum: number }> = {};
+  const [rows, dates, attention] = await Promise.all([
+    prisma.review.groupBy({ by: ["productId", "status"], where: { shop }, _count: true, _avg: { rating: true } }),
+    prisma.review.groupBy({
+      by: ["productId"], where: { shop }, _max: { createdAt: true, lastCommentAt: true }, _sum: { commentCount: true },
+    }),
+    prisma.review.groupBy({ by: ["productId"], where: { shop, needsReply: true }, _count: true }),
+  ]);
+  const map: Record<string, ProductStat> = {};
+  const get = (id: string) =>
+    (map[id] ||= { total: 0, published: 0, pending: 0, avg: 0, sum: 0, needsReply: 0, comments: 0, lastReviewAt: null, lastCommentAt: null });
   rows.forEach((r: any) => {
-    const m = (map[r.productId] ||= { total: 0, published: 0, pending: 0, avg: 0, sum: 0 });
+    const m = get(r.productId);
     m.total += r._count;
     if (r.status === "published") { m.published += r._count; m.sum += (r._avg.rating || 0) * r._count; }
     if (r.status === "pending") m.pending += r._count;
   });
+  dates.forEach((d: any) => {
+    const m = get(d.productId);
+    m.lastReviewAt = d._max.createdAt ? new Date(d._max.createdAt).toISOString() : null;
+    m.lastCommentAt = d._max.lastCommentAt ? new Date(d._max.lastCommentAt).toISOString() : null;
+    m.comments = d._sum.commentCount || 0;
+  });
+  attention.forEach((a: any) => { get(a.productId).needsReply = a._count; });
   Object.values(map).forEach((m) => { m.avg = m.published ? Math.round((m.sum / m.published) * 10) / 10 : 0; });
   return map;
+}
+
+/** Every comment and reply across the store, newest first (for the Comments page). */
+export async function listComments(opts: { shop: string; productId?: string; needsReply?: boolean; q?: string; page?: number; perPage?: number }) {
+  const where: any = { shop: opts.shop, commentCount: { gt: 0 } };
+  if (opts.productId) where.productId = opts.productId;
+  if (opts.needsReply) where.needsReply = true;
+  const rows = await prisma.review.findMany({
+    where,
+    orderBy: [{ lastCommentAt: { sort: "desc", nulls: "last" } }, { updatedAt: "desc" }],
+    take: 500,
+    select: { id: true, productId: true, author: true, body: true, rating: true, replies: true, needsReply: true },
+  });
+  type Item = {
+    reviewId: string; productId: string; reviewAuthor: string; reviewBody: string; rating: number;
+    node: ReviewComment; parentName: string | null; depth: number; awaiting: boolean;
+  };
+  const items: Item[] = [];
+  const q = (opts.q || "").toLowerCase();
+  for (const r of rows) {
+    const tree = normalizeComments(JSON.parse(r.replies));
+    for (const top of tree) {
+      const nodes: { n: ReviewComment; parent: string | null; depth: number }[] = [];
+      const walk = (n: ReviewComment, parent: string | null, depth: number) => {
+        nodes.push({ n, parent, depth });
+        (n.replies || []).forEach((c) => walk(c, n.name, depth + 1));
+      };
+      walk(top, null, 0);
+      const latest = nodes.reduce((a, b) => (Date.parse(b.n.date) > Date.parse(a.n.date) ? b : a));
+      for (const x of nodes) {
+        const awaiting = x === latest && x.n.type === "customer";
+        if (opts.needsReply && !awaiting) continue;
+        if (q && !`${x.n.name} ${x.n.text}`.toLowerCase().includes(q)) continue;
+        items.push({
+          reviewId: r.id, productId: r.productId, reviewAuthor: r.author, reviewBody: r.body, rating: r.rating,
+          node: x.n, parentName: x.parent, depth: x.depth, awaiting,
+        });
+      }
+    }
+  }
+  items.sort((a, b) => Date.parse(b.node.date) - Date.parse(a.node.date));
+  const perPage = opts.perPage || 25;
+  const page = Math.max(1, opts.page || 1);
+  return {
+    total: items.length,
+    page,
+    pages: Math.max(1, Math.ceil(items.length / perPage)),
+    items: items.slice((page - 1) * perPage, page * perPage),
+  };
 }
 
 export async function listReviews(opts: {
