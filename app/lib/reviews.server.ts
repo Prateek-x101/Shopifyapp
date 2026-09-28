@@ -234,6 +234,29 @@ export async function deleteReview(admin: Admin, shop: string, id: string) {
   if (cur) await recomputeSummary(admin, shop, cur.productId);
 }
 
+/* ───────────────────────── webhook sync ─────────────────────────
+   A review changed outside the app (Shopify admin, API, import): bring the index and summary in step. */
+export async function syncOne(admin: Admin, shop: string, id: string) {
+  const before = await prisma.review.findUnique({ where: { id }, select: { productId: true } });
+  const d = await gql(admin, `query($id: ID!) { metaobject(id: $id) { type ${MO_FIELDS} } }`, { id });
+  const m = d.metaobject;
+  if (!m || m.type !== REVIEW_TYPE) {
+    await removeFromIndex(admin, shop, id);
+    return;
+  }
+  const row = fromMetaobject(shop, m);
+  await upsertIndex(row);
+  await recomputeSummary(admin, shop, row.productId);
+  if (before && before.productId !== row.productId) await recomputeSummary(admin, shop, before.productId);
+}
+
+export async function removeFromIndex(admin: Admin, shop: string, id: string) {
+  const before = await prisma.review.findUnique({ where: { id }, select: { productId: true } });
+  if (!before) return;
+  await prisma.review.deleteMany({ where: { id } });
+  await recomputeSummary(admin, shop, before.productId);
+}
+
 /* ───────────────────────── summary metafield ───────────────────────── */
 export async function recomputeSummary(admin: Admin, shop: string, productId: string) {
   const where = { shop, productId, status: "published" };
