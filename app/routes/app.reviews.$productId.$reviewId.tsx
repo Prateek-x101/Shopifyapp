@@ -5,7 +5,7 @@ import { useAppBridge } from "@shopify/app-bridge-react";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
-import { SOURCES, countComments, normalizeComments } from "../lib/reviews.shared";
+import { countComments, normalizeComments } from "../lib/reviews.shared";
 import {
   addComment,
   createReview,
@@ -207,7 +207,7 @@ export default function EditReview() {
   const date = (r.createdAt ? new Date(r.createdAt) : new Date()).toISOString().slice(0, 10);
 
   return (
-    <s-page heading={isNew ? "Add review" : `Review by ${r.author}`} inlineSize="large">
+    <s-page heading={isNew ? "Add review" : `Review by ${r.author}`}>
       <s-link slot="breadcrumb-actions" href={`/app/reviews/${productId}`}>{productTitle}</s-link>
 
       <Form method="post" encType="multipart/form-data" id="review-form">
@@ -217,19 +217,12 @@ export default function EditReview() {
         <input type="hidden" name="verified" value={String(verified)} />
         <input type="hidden" name="orderId" value={orderId} />
         <input type="hidden" name="removeAvatar" value={String(removeAvatar)} />
+        <input type="hidden" name="title" value={r.title || ""} />
+        <input type="hidden" name="source" value={r.source || (isNew ? "WhatsApp" : "Website")} />
 
-        {/* 1 · rating, title, reviewer */}
-        <s-section heading="Review">
+        {/* 1 · reviewer first, then the rating */}
+        <s-section heading="Reviewer">
           <s-stack gap="base">
-            <s-grid gridTemplateColumns="1fr 2fr" gap="base">
-              <s-select label="Rating" name="rating" value={String(r.rating || 5)} error={errors.rating}>
-                {[5, 4, 3, 2, 1].map((n) => (
-                  <s-option key={n} value={String(n)}>{"★".repeat(n)}{"☆".repeat(5 - n)} ({n})</s-option>
-                ))}
-              </s-select>
-              <s-text-field label="Title (optional)" name="title" defaultValue={r.title || ""} placeholder="e.g. Perfect fit" />
-            </s-grid>
-
             <s-stack direction="inline" gap="base" alignItems="center">
               <s-avatar
                 size="large"
@@ -238,7 +231,7 @@ export default function EditReview() {
                 {...(avatarPreview && !removeAvatar ? { src: avatarPreview } : {})}
               />
               <s-stack gap="small-200">
-                <s-text type="strong">Reviewer picture</s-text>
+                <s-text type="strong">Picture</s-text>
                 <input
                   type="file"
                   name="avatarFile"
@@ -257,21 +250,23 @@ export default function EditReview() {
               </s-stack>
             </s-stack>
 
+            <s-text-field
+              label="Name"
+              name="author"
+              defaultValue={r.author || ""}
+              error={errors.author}
+              required
+              onInput={(e: any) => setAuthorName(e.currentTarget.value)}
+            />
             <s-grid gridTemplateColumns="1fr 1fr" gap="base">
-              <s-text-field
-                label="Name"
-                name="author"
-                defaultValue={r.author || ""}
-                error={errors.author}
-                required
-                onInput={(e: any) => setAuthorName(e.currentTarget.value)}
-              />
               <s-text-field label="City" name="location" defaultValue={r.location || ""} placeholder="e.g. Pune" />
               <s-date-field label="Review date" name="createdAt" defaultValue={date} />
-              <s-select label="Source" name="source" value={r.source || (isNew ? "WhatsApp" : "Website")}>
-                {SOURCES.map((s) => <s-option key={s} value={s}>{s}</s-option>)}
-              </s-select>
             </s-grid>
+            <s-select label="Rating" name="rating" value={String(r.rating || 5)} error={errors.rating}>
+              {[5, 4, 3, 2, 1].map((n) => (
+                <s-option key={n} value={String(n)}>{"★".repeat(n)}{"☆".repeat(5 - n)} ({n})</s-option>
+              ))}
+            </s-select>
           </s-stack>
         </s-section>
 
