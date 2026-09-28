@@ -31,13 +31,13 @@ function limited(key: string, max = 5, windowMs = 10 * 60 * 1000) {
 }
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
-  const { session } = await authenticate.public.appProxy(request);
+  const { session, admin } = await authenticate.public.appProxy(request);
   if (!session) return json({ error: "App not installed" }, { status: 401 });
   const path = params["*"] || "";
   const sp = new URL(request.url).searchParams;
 
   // storefront review widget: /apps/engine?action=...
-  if (!path && sp.get("action")) return legacyGet(session.shop, sp);
+  if (!path && sp.get("action")) return legacyGet(session.shop, sp, admin || null);
 
   if (path === "reviews") {
     const productId = (sp.get("product") || "").replace(/\D/g, "");

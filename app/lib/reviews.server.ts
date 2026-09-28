@@ -4,12 +4,16 @@
  *  Source of truth : Shopify metaobject type `vw_review` (lives in the store forever)
  *  Fast index      : Prisma `Review` table (pagination / filters for 10,000+ reviews)
  *  Storefront SSR  : product metafield `vw_reviews.summary` (avg, counts, top reviews)
+ *  Votes           : customer metafield `vw_reviews.votes` = { h: [review ids marked helpful], l: [comment/reply ids liked] }
+ *                    (private, admin only). Counts live on the review metaobject (helpful, replies[].likeCount).
  */
 import prisma from "../db.server";
 
 export const REVIEW_TYPE = "vw_review";
 export const SUMMARY_NS = "vw_reviews";
 export const SUMMARY_KEY = "summary";
+export const VOTES_NS = "vw_reviews";
+export const VOTES_KEY = "votes";
 import { SOURCES, STATUSES, countComments, normalizeComments } from "./reviews.shared";
 import type { ReviewComment } from "./reviews.shared";
 export { SOURCES, STATUSES, countComments, normalizeComments };
@@ -96,6 +100,21 @@ export async function ensureDefinitions(admin: Admin) {
         type: "json",
         description: "Written by the Vesture Studio app. Rating, counts and top reviews for the product page.",
         access: { storefront: "PUBLIC_READ" },
+      },
+    });
+  }
+
+  const vd = await gql(admin, `{ metafieldDefinitions(first: 5, ownerType: CUSTOMER, namespace: "${VOTES_NS}", key: "${VOTES_KEY}") { nodes { id } } }`);
+  if (!vd.metafieldDefinitions.nodes.length) {
+    await gql(admin, `mutation($d: MetafieldDefinitionInput!) {
+      metafieldDefinitionCreate(definition: $d) { createdDefinition { id } userErrors { message } } }`, {
+      d: {
+        name: "Review votes",
+        namespace: VOTES_NS,
+        key: VOTES_KEY,
+        ownerType: "CUSTOMER",
+        type: "json",
+        description: "Written by the Vesture Studio app. Reviews this customer marked helpful (h) and comments/replies they liked (l), so nobody can vote twice.",
       },
     });
   }
@@ -288,14 +307,13 @@ export async function recomputeSummary(admin: Admin, shop: string, productId: st
     orderBy: [{ featured: "desc" }, { hasMedia: "desc" }, { createdAt: "desc" }],
     take: LEGACY_PREVIEW,
   });
-  const helpfulMap = await helpfulIdsFor(preview.map((r) => r.id));
   const legacy = {
     total_count: agg._count,
     avg_rating: summary.avg,
     star_counts: dist,
     photo_count: photos,
     page_count: 0, // the widget loads the rest page by page from the app proxy
-    preview_reviews: preview.map((r) => legacyReview(r, helpfulMap[r.id] || [])),
+    preview_reviews: preview.map((r) => legacyReview(r)),
     updated_at: summary.updated,
   };
   await gql(admin, `mutation($m: [MetafieldsSetInput!]!) { metafieldsSet(metafields: $m) { userErrors { message } } }`, {
@@ -307,32 +325,45 @@ export async function recomputeSummary(admin: Admin, shop: string, productId: st
   return summary;
 }
 
+/* ───────────────────────── votes (customer metafield) ───────────────────────── */
+export type VoteList = { h: string[]; l: string[] };
+const customerGid = (id: string) => (id.startsWith("gid://") ? id : `gid://shopify/Customer/${id}`);
+
+/** The customer's own votes. First read after the update also carries over votes the old version kept in the database. */
+export async function getVotes(admin: Admin, shop: string, customerId: string): Promise<VoteList> {
+  const d = await gql(admin, `query($id: ID!) { customer(id: $id) { metafield(namespace: "${VOTES_NS}", key: "${VOTES_KEY}") { value } } }`, {
+    id: customerGid(customerId),
+  });
+  const raw = d.customer?.metafield?.value;
+  if (raw) {
+    try {
+      const v = JSON.parse(raw);
+      return { h: Array.isArray(v.h) ? v.h.map(String) : [], l: Array.isArray(v.l) ? v.l.map(String) : [] };
+    } catch {
+      /* fall through to a fresh list */
+    }
+  }
+  const old = await prisma.vote.findMany({ where: { shop, customerId }, select: { kind: true, targetId: true } });
+  const v: VoteList = {
+    h: old.filter((x) => x.kind === "helpful").map((x) => x.targetId),
+    l: old.filter((x) => x.kind === "like").map((x) => x.targetId),
+  };
+  if (old.length) await saveVotes(admin, customerId, v);
+  return v;
+}
+
+async function saveVotes(admin: Admin, customerId: string, v: VoteList) {
+  const r = await gql(admin, `mutation($m: [MetafieldsSetInput!]!) { metafieldsSet(metafields: $m) { userErrors { field message } } }`, {
+    m: [{ ownerId: customerGid(customerId), namespace: VOTES_NS, key: VOTES_KEY, type: "json", value: JSON.stringify(v) }],
+  });
+  const errs = r.metafieldsSet.userErrors;
+  if (errs?.length) throw new Error("Could not save vote: " + errs.map((e: any) => e.message).join(", "));
+}
+
 /* ───────────────────────── storefront widget format ───────────────────────── */
 export const LEGACY_NS = "engine_review";
 export const LEGACY_KEY = "summary_v2"; // v1 holds the old generated data and is left untouched
 const LEGACY_PREVIEW = 10;
-
-export async function helpfulIdsFor(reviewIds: string[]) {
-  const map: Record<string, string[]> = {};
-  if (!reviewIds.length) return map;
-  const votes = await prisma.vote.findMany({
-    where: { reviewId: { in: reviewIds }, kind: "helpful" },
-    select: { reviewId: true, customerId: true },
-  });
-  votes.forEach((v) => (map[v.reviewId] ||= []).push(v.customerId));
-  return map;
-}
-
-async function likedIdsFor(reviewIds: string[]) {
-  const map: Record<string, string[]> = {};
-  if (!reviewIds.length) return map;
-  const votes = await prisma.vote.findMany({
-    where: { reviewId: { in: reviewIds }, kind: "like" },
-    select: { targetId: true, customerId: true },
-  });
-  votes.forEach((v) => (map[v.targetId] ||= []).push(v.customerId));
-  return map;
-}
 
 /** A review in the shape the storefront widget renders (name, text, comments[], helpfulCount…). */
 export function legacyReview(r: any, helpfulByCustomerIds: string[] = [], likedBy: Record<string, string[]> = {}) {
@@ -373,7 +404,7 @@ export function legacyReview(r: any, helpfulByCustomerIds: string[] = [], likedB
 }
 
 /** Page of reviews for the widget. Page 1 = first 250, page N>1 = 10 reviews from (N-1)*10 (the widget's paging). */
-export async function legacyPage(shop: string, productId: string, page: number) {
+export async function legacyPage(shop: string, productId: string, page: number, customerId = "", votes: VoteList | null = null) {
   const where = { shop, productId, status: "published" };
   const take = page <= 1 ? 250 : 10;
   const skip = page <= 1 ? 0 : (page - 1) * 10;
@@ -381,11 +412,12 @@ export async function legacyPage(shop: string, productId: string, page: number) 
     prisma.review.count({ where }),
     prisma.review.findMany({ where, orderBy: [{ featured: "desc" }, { createdAt: "desc" }], skip, take }),
   ]);
-  const ids = rows.map((r) => r.id);
-  const [helpful, liked] = await Promise.all([helpfulIdsFor(ids), likedIdsFor(ids)]);
+  const mine = customerId && votes ? votes : { h: [], l: [] };
+  const liked: Record<string, string[]> = {};
+  mine.l.forEach((id) => (liked[id] = [customerId]));
   return {
     success: true,
-    reviews: rows.map((r) => legacyReview(r, helpful[r.id] || [], liked)),
+    reviews: rows.map((r) => legacyReview(r, mine.h.includes(r.id) ? [customerId] : [], liked)),
     count: rows.length,
     totalCount: total,
     pageCount: Math.max(1, Math.ceil(total / 10)),
@@ -453,50 +485,38 @@ export async function removeComment(admin: Admin, shop: string, reviewId: string
   if (!cur || cur.shop !== shop) throw new Error("Review not found");
   const tree = normalizeComments(JSON.parse(cur.replies));
   removeNode(tree, commentId);
-  await prisma.vote.deleteMany({ where: { targetId: commentId } });
   await patchReview(admin, shop, reviewId, { replies: tree });
 }
 
-/** Helpful on a review: one vote per customer, can be undone. */
+/** Helpful on a review: one vote per customer (kept on the customer), can be undone. */
 export async function setHelpful(admin: Admin, shop: string, reviewId: string, customerId: string, liked: boolean) {
   const cur = await prisma.review.findUnique({ where: { id: reviewId } });
   if (!cur || cur.shop !== shop || cur.status !== "published") throw new Error("Review not found");
-  if (liked) {
-    await prisma.vote.upsert({
-      where: { targetId_customerId_kind: { targetId: reviewId, customerId, kind: "helpful" } },
-      create: { shop, reviewId, targetId: reviewId, customerId, kind: "helpful" },
-      update: {},
-    });
-  } else {
-    await prisma.vote.deleteMany({ where: { targetId: reviewId, customerId, kind: "helpful" } });
-  }
-  const count = await prisma.vote.count({ where: { targetId: reviewId, kind: "helpful" } });
-  if (count !== cur.helpful) await patchReview(admin, shop, reviewId, { helpful: count });
+  const v = await getVotes(admin, shop, customerId);
+  const has = v.h.includes(reviewId);
+  if (liked === has) return { liked, helpfulCount: cur.helpful };
+  v.h = liked ? [...v.h, reviewId] : v.h.filter((x) => x !== reviewId);
+  await saveVotes(admin, customerId, v);
+  const count = Math.max(0, (cur.helpful || 0) + (liked ? 1 : -1));
+  await patchReview(admin, shop, reviewId, { helpful: count });
   return { liked, helpfulCount: count };
 }
 
-/** Like on a comment or reply. */
+/** Like on a comment or reply (kept on the customer). */
 export async function setThreadLike(admin: Admin, shop: string, reviewId: string, targetId: string, customerId: string, liked: boolean) {
   const cur = await prisma.review.findUnique({ where: { id: reviewId } });
   if (!cur || cur.shop !== shop) throw new Error("Review not found");
   const tree = normalizeComments(JSON.parse(cur.replies));
   const node = findNode(tree, targetId);
   if (!node) throw new Error("Comment not found");
-  if (liked) {
-    await prisma.vote.upsert({
-      where: { targetId_customerId_kind: { targetId, customerId, kind: "like" } },
-      create: { shop, reviewId, targetId, customerId, kind: "like" },
-      update: {},
-    });
-  } else {
-    await prisma.vote.deleteMany({ where: { targetId, customerId, kind: "like" } });
-  }
-  const count = await prisma.vote.count({ where: { targetId, kind: "like" } });
-  if (node.likeCount !== count) {
-    node.likeCount = count;
-    await patchReview(admin, shop, reviewId, { replies: tree });
-  }
-  return { liked, likeCount: count };
+  const v = await getVotes(admin, shop, customerId);
+  const has = v.l.includes(targetId);
+  if (liked === has) return { liked, likeCount: node.likeCount };
+  v.l = liked ? [...v.l, targetId] : v.l.filter((x) => x !== targetId);
+  await saveVotes(admin, customerId, v);
+  node.likeCount = Math.max(0, (node.likeCount || 0) + (liked ? 1 : -1));
+  await patchReview(admin, shop, reviewId, { replies: tree });
+  return { liked, likeCount: node.likeCount };
 }
 
 /** Shape sent to the storefront: no order ids, no internal fields. */

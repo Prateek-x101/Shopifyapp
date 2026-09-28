@@ -14,6 +14,7 @@ import {
   createReview,
   gql,
   legacyPage,
+  getVotes,
   setHelpful,
   setThreadLike,
   uploadImages,
@@ -39,14 +40,22 @@ export function limited(key: string, max = 5, windowMs = 10 * 60 * 1000) {
 const num = (v: unknown) => String(v ?? "").split("/").pop()!.replace(/\D/g, "");
 const reviewGid = (id: unknown) => `gid://shopify/Metaobject/${num(id)}`;
 
-export async function legacyGet(shop: string, sp: URLSearchParams) {
+export async function legacyGet(shop: string, sp: URLSearchParams, admin: Admin | null = null) {
   const action = sp.get("action") || "";
   const productId = num(sp.get("productId") || sp.get("product"));
 
   if (action === "get_reviews_page") {
     if (!productId) return json({ success: false, error: "productId required" }, { status: 400 });
     const page = Math.max(1, parseInt(sp.get("page") || "1", 10) || 1);
-    return json(await legacyPage(shop, productId, page), { headers: { "Cache-Control": "public, max-age=30" } });
+    const customerId = num(sp.get("logged_in_customer_id"));
+    // a logged-in shopper also gets their own helpful/like marks, so that answer must not be shared
+    let votes = null;
+    if (customerId && admin) {
+      try { votes = await getVotes(admin, shop, customerId); } catch { votes = null; }
+    }
+    return json(await legacyPage(shop, productId, page, customerId, votes), {
+      headers: { "Cache-Control": customerId ? "private, no-store" : "public, max-age=30" },
+    });
   }
 
   if (action === "get_review_stats") {

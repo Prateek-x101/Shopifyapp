@@ -7,9 +7,9 @@ import { authenticate } from "../shopify.server";
 import { json, legacyGet, legacyPost } from "../lib/legacy-proxy.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { session } = await authenticate.public.appProxy(request);
+  const { session, admin } = await authenticate.public.appProxy(request);
   if (!session) return json({ success: false, error: "App not installed" }, { status: 401 });
-  return legacyGet(session.shop, new URL(request.url).searchParams);
+  return legacyGet(session.shop, new URL(request.url).searchParams, admin || null);
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
