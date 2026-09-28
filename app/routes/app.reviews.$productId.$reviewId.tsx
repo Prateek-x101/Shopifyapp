@@ -1,6 +1,6 @@
 import type { ActionFunctionArgs, HeadersFunction, LoaderFunctionArgs } from "react-router";
 import { Form, useActionData, useFetcher, useLoaderData, useNavigation } from "react-router";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
@@ -12,13 +12,37 @@ import {
   deleteReview,
   gql,
   removeComment,
+  updateComment,
   updateReview,
   uploadImages,
+  uploadMedia,
 } from "../lib/reviews.server";
 import type { ReviewImage } from "../lib/reviews.server";
 import type { ReviewComment } from "../lib/reviews.shared";
 
 const gidOf = (id: string) => `gid://shopify/Metaobject/${id}`;
+const initials = (name: string) =>
+  (String(name || "?").match(/[A-Za-zऀ-ॿ]+/g) || ["?"]).slice(0, 2).map((w) => w[0].toUpperCase()).join("");
+
+/** Everyone who speaks in this review: the reviewer and each commenter (for "Reply as"). */
+function peopleOf(review: any) {
+  const out: { name: string; avatar: string | null }[] = [];
+  const seen = new Set<string>();
+  const add = (name: string, avatar: string | null) => {
+    const k = name.trim().toLowerCase();
+    if (!k || seen.has(k)) return;
+    seen.add(k);
+    out.push({ name: name.trim(), avatar });
+  };
+  if (review?.author) add(review.author, review.avatar?.url || null);
+  const walk = (list: ReviewComment[]) =>
+    list.forEach((c) => {
+      if (c.type !== "store") add(c.name, c.avatar || null);
+      walk(c.replies || []);
+    });
+  walk(review?.replies || []);
+  return out;
+}
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
@@ -32,24 +56,16 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     review = {
       ...r,
       images: JSON.parse(r.images) as ReviewImage[],
+      avatar: r.avatar ? (JSON.parse(r.avatar) as { id: string; url: string }) : null,
       replies: normalizeComments(JSON.parse(r.replies)),
       createdAt: r.createdAt.toISOString(),
       updatedAt: r.updatedAt.toISOString(),
     };
   }
-  return { productId, productTitle: d.product?.title || "Product", shopName: d.shop.name, isNew, review };
+  return { productId, productTitle: d.product?.title || "Product", shopName: d.shop.name as string, isNew, review, people: peopleOf(review) };
 };
 
-/** Verified buyer only when the order really contains this product. */
-async function orderHasProduct(admin: any, orderName: string, productId: string) {
-  const name = orderName.trim().replace(/^#?/, "#");
-  const d = await gql(admin, `query($q: String!) { orders(first: 1, query: $q) { nodes { name lineItems(first: 50) { nodes { product { id } } } } } }`, {
-    q: `name:${name}`,
-  });
-  const order = d.orders.nodes[0];
-  if (!order) return false;
-  return order.lineItems.nodes.some((li: any) => li.product?.id === `gid://shopify/Product/${productId}`);
-}
+const fileOf = (v: FormDataEntryValue | null) => (v && typeof v !== "string" && v.size > 0 ? v : null);
 
 export const action = async ({ request, params }: ActionFunctionArgs) => {
   const { admin, session, redirect } = await authenticate.admin(request);
@@ -64,45 +80,78 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     return redirect(`/app/reviews/${productId}`);
   }
 
+  /* ── comments ── */
   if (intent === "reply-add") {
     const text = String(fd.get("replyText") || "").trim();
-    if (!text) return { error: "Write a reply first" };
+    if (!text) return { ok: false, message: "Write the reply first" };
     const parentId = String(fd.get("parentId") || "") || null;
-    await addComment(admin, session.shop, id, { name: String(fd.get("replyAuthor") || "Store"), text, type: "store" }, parentId);
-    return { ok: true, message: parentId ? "Reply added" : "Comment added" };
+    const as = String(fd.get("replyAs") || "store");
+    let name = String(fd.get("shopName") || "Store");
+    let type: "store" | "customer" = "store";
+    let avatar: string | null = null;
+    if (as.startsWith("person:")) {
+      name = as.slice(7);
+      type = "customer";
+      avatar = String(fd.get("personAvatar") || "") || null;
+    } else if (as === "new") {
+      name = String(fd.get("newName") || "").trim();
+      if (!name) return { ok: false, message: "Add the new person's name" };
+      type = "customer";
+      const pic = fileOf(fd.get("newAvatar"));
+      if (pic) {
+        try { avatar = (await uploadImages(admin, [pic]))[0]?.url || null; } catch { return { ok: false, message: "Picture upload failed" }; }
+      }
+    }
+    await addComment(admin, session.shop, id, { name, text, type, avatar }, parentId);
+    return { ok: true, message: parentId ? `Reply posted as ${name}` : `Comment posted as ${name}` };
   }
-  if (intent === "reply-delete") {
-    await removeComment(admin, session.shop, id, String(fd.get("replyId") || ""));
-    return { ok: true, message: "Removed" };
+  if (intent === "comment-edit") {
+    await updateComment(admin, session.shop, id, String(fd.get("commentId")), {
+      text: String(fd.get("text") || ""),
+      name: String(fd.get("name") || ""),
+    });
+    return { ok: true, message: "Comment updated" };
+  }
+  if (intent === "comment-status") {
+    const status = fd.get("status") === "hidden" ? "hidden" : "approved";
+    await updateComment(admin, session.shop, id, String(fd.get("commentId")), { status });
+    return { ok: true, message: status === "hidden" ? "Hidden from the store" : "Shown on the store" };
+  }
+  if (intent === "comment-delete") {
+    await removeComment(admin, session.shop, id, String(fd.get("commentId") || ""));
+    return { ok: true, message: "Deleted" };
   }
 
-  // ── save (create / update) ──
+  /* ── save (create / update) ── */
   const rating = parseInt(String(fd.get("rating") || "5"), 10);
   const body = String(fd.get("body") || "").trim();
   const author = String(fd.get("author") || "").trim();
-  const orderId = String(fd.get("orderId") || "").trim() || null;
-  const wantVerified = fd.get("verified") === "on" || fd.get("verified") === "true";
   const errors: Record<string, string> = {};
   if (!body) errors.body = "Write the review text";
-  if (!author) errors.author = "Add the customer's name";
+  if (!author) errors.author = "Add the reviewer's name";
   if (!(rating >= 1 && rating <= 5)) errors.rating = "Choose 1 to 5 stars";
-
-  let verified = false;
-  if (wantVerified) {
-    if (!orderId) errors.orderId = "Add the order number to mark as verified";
-    else if (!(await orderHasProduct(admin, orderId, productId))) errors.orderId = "This order does not contain this product";
-    else verified = true;
-  }
   if (Object.keys(errors).length) return { errors };
 
   const existing = isNew ? null : await prisma.review.findUnique({ where: { id } });
-  const keep = new Set(fd.getAll("keepImage").map(String));
+  const keep = new Set(fd.getAll("keepMedia").map(String));
   const kept: ReviewImage[] = existing ? (JSON.parse(existing.images) as ReviewImage[]).filter((i) => keep.has(i.id)) : [];
   let uploaded: ReviewImage[] = [];
   try {
-    uploaded = await uploadImages(admin, fd.getAll("photos").filter((f): f is File => typeof f !== "string"));
+    uploaded = await uploadMedia(admin, fd.getAll("media").filter((f): f is File => typeof f !== "string"));
   } catch (e: any) {
-    return { errors: { photos: e.message || "Photo upload failed" } };
+    return { errors: { media: e.message || "Upload failed" } };
+  }
+
+  let avatar = existing?.avatar ? JSON.parse(existing.avatar) : null;
+  if (fd.get("removeAvatar") === "true") avatar = null;
+  const pic = fileOf(fd.get("avatarFile"));
+  if (pic) {
+    try {
+      const up = (await uploadImages(admin, [pic]))[0];
+      if (up) avatar = { id: up.id, url: up.url };
+    } catch {
+      return { errors: { avatar: "Picture upload failed" } };
+    }
   }
 
   const createdRaw = String(fd.get("createdAt") || "");
@@ -112,15 +161,16 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     title: String(fd.get("title") || "").trim() || null,
     body,
     author,
+    avatar,
     location: String(fd.get("location") || "").trim() || null,
     status: String(fd.get("status") || "published"),
-    verified,
+    verified: fd.get("verified") === "true",
     source: String(fd.get("source") || "Website"),
-    orderId,
-    images: [...kept, ...uploaded].slice(0, 8),
+    orderId: String(fd.get("orderId") || "").trim() || null,
+    images: [...kept, ...uploaded].slice(0, 12),
     replies: existing ? JSON.parse(existing.replies) : [],
     helpful: existing?.helpful || 0,
-    featured: fd.get("featured") === "on" || fd.get("featured") === "true",
+    featured: fd.get("featured") === "true",
     createdAt: createdRaw ? new Date(createdRaw + "T12:00:00+05:30").toISOString() : existing?.createdAt.toISOString(),
   };
 
@@ -133,51 +183,112 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
 };
 
 export default function EditReview() {
-  const { productId, productTitle, shopName, isNew, review } = useLoaderData<typeof loader>();
+  const { productId, productTitle, shopName, isNew, review, people } = useLoaderData<typeof loader>();
   const data = useActionData<typeof action>() as any;
   const nav = useNavigation();
   const shopify = useAppBridge();
-  const saving = nav.state === "submitting" && nav.formData?.get("intent") !== "delete";
+  const saving = nav.state === "submitting" && nav.formData?.get("intent") === "save";
   const errors = data?.errors || {};
-  const replyFetcher = useFetcher<typeof action>();
-  const [replyTo, setReplyTo] = useState<{ id: string; name: string } | null>(null);
+  const r = review || {};
+
+  // right-column controls feed hidden inputs of the main form
+  const [status, setStatus] = useState<string>(r.status || "published");
+  const [featured, setFeatured] = useState<boolean>(!!r.featured);
+  const [verified, setVerified] = useState<boolean>(isNew ? true : !!r.verified);
+  const [orderId, setOrderId] = useState<string>(r.orderId || "");
+  const [avatarPreview, setAvatarPreview] = useState<string>(r.avatar?.url || "");
+  const [removeAvatar, setRemoveAvatar] = useState(false);
+  const [authorName, setAuthorName] = useState<string>(r.author || "");
 
   useEffect(() => {
-    const msg = data?.message || (replyFetcher.data as any)?.message;
-    if (msg) shopify.toast.show(msg);
-  }, [data, replyFetcher.data, shopify]);
+    if (data?.message) shopify.toast.show(data.message, { isError: data.ok === false });
+  }, [data, shopify]);
 
-  const r = review || {};
   const date = (r.createdAt ? new Date(r.createdAt) : new Date()).toISOString().slice(0, 10);
 
   return (
-    <s-page heading={isNew ? "Add review" : `Review by ${r.author}`}>
+    <s-page heading={isNew ? "Add review" : `Review by ${r.author}`} inlineSize="large">
       <s-link slot="breadcrumb-actions" href={`/app/reviews/${productId}`}>{productTitle}</s-link>
 
       <Form method="post" encType="multipart/form-data" id="review-form">
         <input type="hidden" name="intent" value="save" />
+        <input type="hidden" name="status" value={status} />
+        <input type="hidden" name="featured" value={String(featured)} />
+        <input type="hidden" name="verified" value={String(verified)} />
+        <input type="hidden" name="orderId" value={orderId} />
+        <input type="hidden" name="removeAvatar" value={String(removeAvatar)} />
 
+        {/* 1 · rating, title, reviewer */}
         <s-section heading="Review">
           <s-stack gap="base">
-            <s-select label="Rating" name="rating" value={String(r.rating || 5)} error={errors.rating}>
-              {[5, 4, 3, 2, 1].map((n) => (
-                <s-option key={n} value={String(n)}>{"★".repeat(n)}{"☆".repeat(5 - n)}  ({n})</s-option>
-              ))}
-            </s-select>
-            <s-text-field label="Title (optional)" name="title" defaultValue={r.title || ""} placeholder="e.g. Perfect fit" />
-            <s-text-area label="Review" name="body" rows={5} defaultValue={r.body || ""} error={errors.body} required />
+            <s-grid gridTemplateColumns="1fr 2fr" gap="base">
+              <s-select label="Rating" name="rating" value={String(r.rating || 5)} error={errors.rating}>
+                {[5, 4, 3, 2, 1].map((n) => (
+                  <s-option key={n} value={String(n)}>{"★".repeat(n)}{"☆".repeat(5 - n)} ({n})</s-option>
+                ))}
+              </s-select>
+              <s-text-field label="Title (optional)" name="title" defaultValue={r.title || ""} placeholder="e.g. Perfect fit" />
+            </s-grid>
+
+            <s-stack direction="inline" gap="base" alignItems="center">
+              <s-avatar
+                size="large"
+                initials={initials(authorName || "?")}
+                alt={authorName || "Reviewer"}
+                {...(avatarPreview && !removeAvatar ? { src: avatarPreview } : {})}
+              />
+              <s-stack gap="small-200">
+                <s-text type="strong">Reviewer picture</s-text>
+                <input
+                  type="file"
+                  name="avatarFile"
+                  accept="image/*"
+                  onChange={(e) => {
+                    const f = e.currentTarget.files?.[0];
+                    if (f) { setAvatarPreview(URL.createObjectURL(f)); setRemoveAvatar(false); }
+                  }}
+                />
+                {(avatarPreview && !removeAvatar) ? (
+                  <s-button variant="tertiary" tone="critical" onClick={() => { setRemoveAvatar(true); setAvatarPreview(""); }}>Remove picture</s-button>
+                ) : (
+                  <s-text color="subdued">Optional. Without a picture the initials show.</s-text>
+                )}
+                {errors.avatar && <s-text tone="critical">{errors.avatar}</s-text>}
+              </s-stack>
+            </s-stack>
+
+            <s-grid gridTemplateColumns="1fr 1fr" gap="base">
+              <s-text-field
+                label="Name"
+                name="author"
+                defaultValue={r.author || ""}
+                error={errors.author}
+                required
+                onInput={(e: any) => setAuthorName(e.currentTarget.value)}
+              />
+              <s-text-field label="City" name="location" defaultValue={r.location || ""} placeholder="e.g. Pune" />
+              <s-date-field label="Review date" name="createdAt" defaultValue={date} />
+              <s-select label="Source" name="source" value={r.source || (isNew ? "WhatsApp" : "Website")}>
+                {SOURCES.map((s) => <s-option key={s} value={s}>{s}</s-option>)}
+              </s-select>
+            </s-grid>
           </s-stack>
         </s-section>
 
-        <s-section heading="Photos">
+        {/* 2 · photos and videos */}
+        <s-section heading="Photos & videos">
           <s-stack gap="base">
             {(r.images || []).length > 0 && (
               <s-stack direction="inline" gap="base">
-                {r.images.map((img: ReviewImage) => (
-                  <s-box key={img.id} padding="small-200" border="base" borderRadius="base">
+                {r.images.map((m: ReviewImage) => (
+                  <s-box key={m.id} padding="small-200" border="base" borderRadius="base">
                     <s-stack gap="small-200" alignItems="center">
-                      <s-thumbnail src={img.url} alt="Review photo" size="large" />
-                      <s-checkbox name="keepImage" value={img.id} label="Keep" defaultChecked />
+                      {m.kind === "video" ? (
+                        <video src={m.url} poster={m.poster || undefined} muted playsInline controls style={{ width: 120, height: 120, objectFit: "cover", borderRadius: 8, background: "#000" }} />
+                      ) : (
+                        <s-thumbnail src={m.url} alt="Review photo" size="large" />
+                      )}
+                      <s-checkbox name="keepMedia" value={m.id} label={m.kind === "video" ? "Keep video" : "Keep"} defaultChecked />
                     </s-stack>
                   </s-box>
                 ))}
@@ -185,99 +296,39 @@ export default function EditReview() {
             )}
             <s-box padding="base" border="base" borderStyle="dashed" borderRadius="base">
               <s-stack gap="small-200">
-                <s-text>Add photos (up to 6, JPG / PNG / WEBP)</s-text>
-                <input type="file" name="photos" accept="image/*" multiple />
-                {errors.photos && <s-text tone="critical">{errors.photos}</s-text>}
+                <s-text>Add photos or videos (JPG, PNG, WEBP, MP4 · videos up to 100 MB)</s-text>
+                <input type="file" name="media" accept="image/*,video/*" multiple />
+                <s-text color="subdued">Videos take a few seconds to process after saving.</s-text>
+                {errors.media && <s-text tone="critical">{errors.media}</s-text>}
               </s-stack>
             </s-box>
           </s-stack>
         </s-section>
 
-        <s-section heading="Customer">
-          <s-grid gridTemplateColumns="1fr 1fr" gap="base">
-            <s-text-field label="Name" name="author" defaultValue={r.author || ""} error={errors.author} required />
-            <s-text-field label="City" name="location" defaultValue={r.location || ""} placeholder="e.g. Pune" />
-            <s-date-field label="Review date" name="createdAt" defaultValue={date} />
-            <s-select label="Source" name="source" value={r.source || (isNew ? "WhatsApp" : "Website")} details="Where this review came from">
-              {SOURCES.map((s) => <s-option key={s} value={s}>{s}</s-option>)}
-            </s-select>
-          </s-grid>
-        </s-section>
-
-        <s-section heading="Verified buyer">
-          <s-stack gap="base">
-            <s-paragraph>
-              The Verified badge is only given when the order number really contains this product.
-            </s-paragraph>
-            <s-grid gridTemplateColumns="1fr 1fr" gap="base" alignItems="end">
-              <s-text-field label="Order number" name="orderId" defaultValue={r.orderId || ""} placeholder="#1001" error={errors.orderId} />
-              <s-checkbox name="verified" label="Mark as verified buyer" defaultChecked={!!r.verified} />
-            </s-grid>
-          </s-stack>
-        </s-section>
-
-        <s-section heading="Visibility">
-          <s-grid gridTemplateColumns="1fr 1fr" gap="base" alignItems="end">
-            <s-select label="Status" name="status" value={r.status || "published"}>
-              <s-option value="published">Published — shown on the store</s-option>
-              <s-option value="pending">Pending — waiting for approval</s-option>
-              <s-option value="hidden">Hidden</s-option>
-            </s-select>
-            <s-checkbox name="featured" label="Pin to the top of the list" defaultChecked={!!r.featured} />
-          </s-grid>
+        {/* 3 · the review text */}
+        <s-section heading="Review text">
+          <s-text-area label="Review" labelAccessibilityVisibility="exclusive" name="body" rows={6} defaultValue={r.body || ""} error={errors.body} required />
         </s-section>
       </Form>
 
-      {!isNew && (
-        <s-section heading={`Comments and replies (${countComments(r.replies || [])})`}>
-          <s-stack gap="base">
-            {(r.replies || []).length === 0 && (
-              <s-text color="subdued">No comments yet. Customers can comment on this review from the product page.</s-text>
-            )}
-            {(r.replies || []).map((c: ReviewComment) => (
-              <ThreadNode
-                key={c.id}
-                node={c}
-                depth={0}
-                onReply={(n) => setReplyTo({ id: n.id, name: n.name })}
-                onDelete={(n) => {
-                  if (confirm("Remove this comment and its replies?")) replyFetcher.submit({ intent: "reply-delete", replyId: n.id }, { method: "POST" });
-                }}
-              />
-            ))}
-            <replyFetcher.Form
-              method="post"
-              onSubmit={() => setTimeout(() => setReplyTo(null), 0)}
-            >
-              <input type="hidden" name="intent" value="reply-add" />
-              <input type="hidden" name="replyAuthor" value={shopName} />
-              <input type="hidden" name="parentId" value={replyTo?.id || ""} />
-              <s-stack gap="small-200">
-                {replyTo && (
-                  <s-stack direction="inline" gap="small-200" alignItems="center">
-                    <s-badge tone="info">Replying to {replyTo.name}</s-badge>
-                    <s-button variant="tertiary" onClick={() => setReplyTo(null)}>Cancel</s-button>
-                  </s-stack>
-                )}
-                <s-text-area
-                  label={replyTo ? `Reply to ${replyTo.name} as ${shopName}` : `Comment as ${shopName}`}
-                  name="replyText"
-                  rows={3}
-                  placeholder="Thank you for the review!"
-                />
-                <s-stack direction="inline" justifyContent="end">
-                  <s-button type="submit" {...(replyFetcher.state !== "idle" ? { loading: true } : {})}>
-                    {replyTo ? "Post reply" : "Post comment"}
-                  </s-button>
-                </s-stack>
-              </s-stack>
-            </replyFetcher.Form>
-          </s-stack>
-        </s-section>
-      )}
-
-      <s-section slot="aside" heading="Save">
+      {/* ── right column ── */}
+      <s-section slot="aside" heading="Visibility">
         <s-stack gap="base">
+          <s-select label="Status" value={status} onChange={(e: any) => setStatus(e.currentTarget.value)}>
+            <s-option value="published">Published — on the store</s-option>
+            <s-option value="pending">Pending — waiting</s-option>
+            <s-option value="hidden">Hidden</s-option>
+          </s-select>
+          <s-checkbox label="Pin to the top" checked={featured} onChange={(e: any) => setFeatured(!!e.currentTarget.checked)} />
+          <s-checkbox
+            label="Verified buyer"
+            details="Shows “✓ Verified buyer” on the store"
+            checked={verified}
+            onChange={(e: any) => setVerified(!!e.currentTarget.checked)}
+          />
+          {verified && (
+            <s-text-field label="Order number (optional)" value={orderId} placeholder="#1001" onInput={(e: any) => setOrderId(e.currentTarget.value)} />
+          )}
           <s-button
             variant="primary"
             onClick={() => (document.getElementById("review-form") as HTMLFormElement | null)?.requestSubmit()}
@@ -294,48 +345,225 @@ export default function EditReview() {
           {!isNew && r.helpful > 0 && <s-text color="subdued">{r.helpful} people found this helpful</s-text>}
         </s-stack>
       </s-section>
+
+      {!isNew && (
+        <s-section slot="aside" heading={`Comments & replies (${countComments(r.replies || [])})`}>
+          <Thread review={r} shopName={shopName} people={people} />
+        </s-section>
+      )}
     </s-page>
   );
 }
 
 export const headers: HeadersFunction = (headersArgs) => boundary.headers(headersArgs);
 
-function ThreadNode({
-  node,
-  depth,
-  onReply,
-  onDelete,
-}: {
-  node: ReviewComment;
-  depth: number;
-  onReply: (n: ReviewComment) => void;
-  onDelete: (n: ReviewComment) => void;
-}) {
+/* ───────────────────────── comments panel ───────────────────────── */
+
+function Thread({ review, shopName, people }: { review: any; shopName: string; people: { name: string; avatar: string | null }[] }) {
+  const [target, setTarget] = useState<{ id: string; name: string } | null>(null);
+  const composerRef = useRef<HTMLDivElement>(null);
+  const replies: ReviewComment[] = review.replies || [];
+
+  const replyTo = (n: ReviewComment) => {
+    setTarget({ id: n.id, name: n.name });
+    setTimeout(() => composerRef.current?.scrollIntoView({ behavior: "smooth", block: "center" }), 50);
+  };
+
   return (
-    <div style={{ marginLeft: depth ? 24 : 0, borderLeft: depth ? "2px solid #e3e3e3" : "none", paddingLeft: depth ? 12 : 0 }}>
-      <s-box padding="small-200" background={node.type === "store" ? "subdued" : "base"} borderRadius="base" border="base">
-        <s-stack direction="inline" justifyContent="space-between" alignItems="start" gap="base">
-          <s-stack gap="small-300">
-            <s-stack direction="inline" gap="small-200" alignItems="center">
-              <s-text type="strong">{node.name}</s-text>
-              {node.type === "store" && <s-badge tone="info">Store</s-badge>}
-              {node.verified && <s-badge tone="success">Verified</s-badge>}
-              <s-text color="subdued">{new Date(node.date).toLocaleDateString("en-IN")}</s-text>
-              {node.likeCount > 0 && <s-text color="subdued">♥ {node.likeCount}</s-text>}
+    <s-stack gap="base">
+      {replies.length === 0 && <s-text color="subdued">No comments yet.</s-text>}
+      {replies.map((c) => (
+        <Node key={c.id} node={c} depth={0} onReply={replyTo} />
+      ))}
+      <div ref={composerRef}>
+        <Composer
+          key={target?.id || "top"}
+          target={target}
+          onDone={() => setTarget(null)}
+          shopName={shopName}
+          people={people}
+          reviewer={review.author}
+        />
+      </div>
+    </s-stack>
+  );
+}
+
+function Who({ name, avatar, store, size = "small" }: { name: string; avatar?: string | null; store?: boolean; size?: any }) {
+  return (
+    <s-avatar
+      size={size}
+      initials={store ? "✓" : initials(name)}
+      alt={name}
+      {...(avatar ? { src: avatar } : {})}
+    />
+  );
+}
+
+function Node({ node, depth, onReply }: { node: ReviewComment; depth: number; onReply: (n: ReviewComment) => void }) {
+  const fetcher = useFetcher<typeof action>();
+  const shopify = useAppBridge();
+  const [editing, setEditing] = useState(false);
+  const busy = fetcher.state !== "idle";
+  const hidden = node.status === "hidden";
+  const store = node.type === "store";
+
+  useEffect(() => {
+    const d: any = fetcher.data;
+    if (d?.message) { shopify.toast.show(d.message, { isError: d.ok === false }); if (d.ok) setEditing(false); }
+  }, [fetcher.data, shopify]);
+
+  const send = (data: Record<string, string>) => fetcher.submit({ commentId: node.id, ...data }, { method: "POST" });
+  const when = new Date(node.date).toLocaleDateString("en-IN", { day: "numeric", month: "short" });
+
+  return (
+    <div style={{ marginLeft: depth ? 14 : 0, paddingLeft: depth ? 12 : 0, borderLeft: depth ? "2px solid #e3e3e3" : "none" }}>
+      <div style={{ opacity: hidden ? 0.55 : 1, padding: "8px 0" }}>
+        <s-stack direction="inline" gap="small-200" alignItems="start">
+          <Who name={node.name} avatar={node.avatar} store={store} size={depth ? "small-200" : "small"} />
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <s-stack gap="small-300">
+              <s-stack direction="inline" gap="small-300" alignItems="center">
+                <s-text type="strong">{node.name}</s-text>
+                {store && <s-badge tone="info">Store</s-badge>}
+                {hidden && <s-badge tone="warning">Hidden</s-badge>}
+                <s-text color="subdued">{when}</s-text>
+                {node.likeCount > 0 && <s-text color="subdued">👍 {node.likeCount}</s-text>}
+              </s-stack>
+
+              {editing ? (
+                <fetcher.Form method="post">
+                  <input type="hidden" name="intent" value="comment-edit" />
+                  <input type="hidden" name="commentId" value={node.id} />
+                  <s-stack gap="small-200">
+                    <s-text-field label="Name" name="name" defaultValue={node.name} />
+                    <s-text-area label="Text" name="text" rows={3} defaultValue={node.text} />
+                    <s-stack direction="inline" gap="small-200">
+                      <s-button type="submit" variant="primary" {...(busy ? { loading: true } : {})}>Save</s-button>
+                      <s-button variant="tertiary" onClick={() => setEditing(false)}>Cancel</s-button>
+                    </s-stack>
+                  </s-stack>
+                </fetcher.Form>
+              ) : (
+                <s-text>{node.text}</s-text>
+              )}
+
+              {!editing && (
+                <s-stack direction="inline" gap="small-100">
+                  <s-button variant="tertiary" icon="chat" onClick={() => onReply(node)}>Reply</s-button>
+                  <s-button variant="tertiary" icon="edit" onClick={() => setEditing(true)}>Edit</s-button>
+                  <s-button
+                    variant="tertiary"
+                    icon={hidden ? "view" : "hide"}
+                    onClick={() => send({ intent: "comment-status", status: hidden ? "approved" : "hidden" })}
+                    {...(busy ? { disabled: true } : {})}
+                  >
+                    {hidden ? "Show" : "Hide"}
+                  </s-button>
+                  <s-button
+                    variant="tertiary"
+                    tone="critical"
+                    icon="delete"
+                    accessibilityLabel="Delete"
+                    onClick={() => { if (confirm("Delete this and its replies?")) send({ intent: "comment-delete" }); }}
+                  />
+                </s-stack>
+              )}
             </s-stack>
-            <s-text>{node.text}</s-text>
-          </s-stack>
-          <s-stack direction="inline" gap="small-300">
-            <s-button variant="tertiary" icon="chat" accessibilityLabel="Reply" onClick={() => onReply(node)} />
-            <s-button variant="tertiary" tone="critical" icon="delete" accessibilityLabel="Remove" onClick={() => onDelete(node)} />
-          </s-stack>
+          </div>
         </s-stack>
-      </s-box>
+      </div>
       {(node.replies || []).map((c) => (
-        <div key={c.id} style={{ marginTop: 8 }}>
-          <ThreadNode node={c} depth={depth + 1} onReply={onReply} onDelete={onDelete} />
-        </div>
+        <Node key={c.id} node={c} depth={depth + 1} onReply={onReply} />
       ))}
     </div>
+  );
+}
+
+function Composer({
+  target,
+  onDone,
+  shopName,
+  people,
+  reviewer,
+}: {
+  target: { id: string; name: string } | null;
+  onDone: () => void;
+  shopName: string;
+  people: { name: string; avatar: string | null }[];
+  reviewer: string;
+}) {
+  const fetcher = useFetcher<typeof action>();
+  const shopify = useAppBridge();
+  const formRef = useRef<HTMLFormElement>(null);
+  const [as, setAs] = useState<string>("store");
+  const [newPic, setNewPic] = useState<string>("");
+  const busy = fetcher.state !== "idle";
+  const person = as.startsWith("person:") ? people.find((p) => `person:${p.name}` === as) : null;
+
+  useEffect(() => {
+    const d: any = fetcher.data;
+    if (!d?.message) return;
+    shopify.toast.show(d.message, { isError: d.ok === false });
+    if (d.ok) {
+      formRef.current?.reset();
+      setNewPic("");
+      onDone();
+    }
+  }, [fetcher.data, shopify]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const label = as === "store" ? shopName : as === "new" ? "a new person" : as.slice(7);
+
+  return (
+    <s-box padding="base" border="base" borderRadius="base" background="subdued">
+      <fetcher.Form method="post" encType="multipart/form-data" ref={formRef}>
+        <input type="hidden" name="intent" value="reply-add" />
+        <input type="hidden" name="parentId" value={target?.id || ""} />
+        <input type="hidden" name="shopName" value={shopName} />
+        <input type="hidden" name="replyAs" value={as} />
+        <input type="hidden" name="personAvatar" value={person?.avatar || ""} />
+        <s-stack gap="small-200">
+          <s-stack direction="inline" gap="small-200" alignItems="center">
+            <s-text type="strong">{target ? `Reply to ${target.name}` : `Comment on ${reviewer}'s review`}</s-text>
+            {target && <s-button variant="tertiary" onClick={onDone}>Cancel</s-button>}
+          </s-stack>
+
+          <s-select label="Reply as" value={as} onChange={(e: any) => setAs(e.currentTarget.value)}>
+            <s-option value="store">{shopName} (store)</s-option>
+            {people.map((p) => (
+              <s-option key={p.name} value={`person:${p.name}`}>{p.name}</s-option>
+            ))}
+            <s-option value="new">+ New person…</s-option>
+          </s-select>
+
+          {as === "new" && (
+            <s-stack direction="inline" gap="small-200" alignItems="center">
+              <s-avatar size="small" initials="+" alt="New person" {...(newPic ? { src: newPic } : {})} />
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <s-stack gap="small-200">
+                  <s-text-field label="Name" name="newName" placeholder="e.g. Aman Verma" />
+                  <input
+                    type="file"
+                    name="newAvatar"
+                    accept="image/*"
+                    onChange={(e) => {
+                      const f = e.currentTarget.files?.[0];
+                      setNewPic(f ? URL.createObjectURL(f) : "");
+                    }}
+                  />
+                </s-stack>
+              </div>
+            </s-stack>
+          )}
+
+          <s-text-area label={`Message as ${label}`} name="replyText" rows={3} placeholder={target ? `Reply to ${target.name}…` : "Write a comment…"} />
+          <s-stack direction="inline" justifyContent="end">
+            <s-button type="submit" variant="primary" {...(busy ? { loading: true } : {})}>
+              {target ? "Post reply" : "Post comment"}
+            </s-button>
+          </s-stack>
+        </s-stack>
+      </fetcher.Form>
+    </s-box>
   );
 }

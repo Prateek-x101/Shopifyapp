@@ -9,7 +9,8 @@ export type ReviewComment = {
   text: string;
   date: string;
   type: "store" | "customer";
-  status: "approved" | "pending";
+  status: "approved" | "pending" | "hidden";
+  avatar?: string | null; // image URL (store-added characters, Google profile…)
   customerId?: string | null;
   verified?: boolean;
   likeCount: number;
@@ -26,7 +27,8 @@ export function normalizeComments(raw: unknown): ReviewComment[] {
     text: String(c.text ?? ""),
     date: String(c.date ?? c.createdAt ?? new Date().toISOString()),
     type: c.type === "store" || c.isStore ? "store" : "customer",
-    status: c.status === "pending" ? "pending" : "approved",
+    status: c.status === "pending" ? "pending" : c.status === "hidden" ? "hidden" : "approved",
+    avatar: c.avatar ? String(c.avatar) : null,
     customerId: c.customerId ? String(c.customerId) : null,
     verified: !!c.verified,
     likeCount: Math.max(0, parseInt(c.likeCount ?? c.likes ?? 0, 10) || 0),

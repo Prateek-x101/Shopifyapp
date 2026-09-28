@@ -47,6 +47,7 @@ model Review {
   source    String   @default("Website")
   orderId   String?
   images    String   @default("[]") // JSON: [{ id, url, alt }]
+  avatar    String?                 // JSON: { id, url } reviewer picture
   replies   String   @default("[]") // JSON: [{ id, author, text, isStore, createdAt }]
   helpful   Int      @default(0)
   featured  Boolean  @default(false)

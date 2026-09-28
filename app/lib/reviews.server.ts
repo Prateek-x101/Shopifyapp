@@ -22,7 +22,7 @@ const TOP_IN_SUMMARY = 6;
 
 type Admin = { graphql: (q: string, o?: { variables?: Record<string, unknown> }) => Promise<Response> };
 
-export type ReviewImage = { id: string; url: string; alt?: string };
+export type ReviewImage = { id: string; url: string; alt?: string; kind?: "image" | "video"; poster?: string };
 export type ReviewReply = ReviewComment;
 export type ReviewInput = {
   productId: string;
@@ -35,7 +35,8 @@ export type ReviewInput = {
   verified?: boolean;
   source?: string;
   orderId?: string | null;
-  images?: ReviewImage[];
+  images?: ReviewImage[];               // photos and videos (kind: "video")
+  avatar?: ReviewImage | null;          // reviewer picture
   replies?: ReviewReply[];
   helpful?: number;
   featured?: boolean;
@@ -88,6 +89,17 @@ export async function ensureDefinitions(admin: Admin) {
     if (errs?.length) throw new Error("Review definition: " + JSON.stringify(errs));
   }
 
+  // fields added after the first version
+  const def = await gql(admin, `{ metaobjectDefinitionByType(type: "${REVIEW_TYPE}") { id fieldDefinitions { key } } }`);
+  const keys = new Set((def.metaobjectDefinitionByType?.fieldDefinitions || []).map((f: any) => f.key));
+  if (def.metaobjectDefinitionByType && !keys.has("avatar")) {
+    await gql(admin, `mutation($id: ID!, $d: MetaobjectDefinitionUpdateInput!) {
+      metaobjectDefinitionUpdate(id: $id, definition: $d) { metaobjectDefinition { id } userErrors { message } } }`, {
+      id: def.metaobjectDefinitionByType.id,
+      d: { fieldDefinitions: [{ create: { key: "avatar", name: "Reviewer picture", type: "file_reference", validations: [{ name: "file_type_options", value: '["Image"]' }] } }] },
+    });
+  }
+
   const mf = await gql(admin, `{ metafieldDefinitions(first: 5, ownerType: PRODUCT, namespace: "${SUMMARY_NS}", key: "${SUMMARY_KEY}") { nodes { id } } }`);
   if (!mf.metafieldDefinitions.nodes.length) {
     await gql(admin, `mutation($d: MetafieldDefinitionInput!) {
@@ -138,19 +150,30 @@ function toFields(r: ReviewInput) {
     { key: "helpful", value: String(r.helpful || 0) },
     { key: "featured", value: String(!!r.featured) },
     { key: "created", value: r.createdAt || new Date().toISOString() },
+    { key: "avatar", value: r.avatar?.id || "" },
   ];
   return f;
 }
 
 const MO_FIELDS = `id updatedAt fields { key value
-  references(first: 10) { nodes { ... on MediaImage { id alt image { url } } } } }`;
+  reference { ... on MediaImage { id image { url } } }
+  references(first: 12) { nodes {
+    ... on MediaImage { id alt image { url } }
+    ... on Video { id alt sources { url mimeType } preview { image { url } } } } } }`;
 
 function fromMetaobject(shop: string, m: any) {
   const get = (k: string) => m.fields.find((f: any) => f.key === k);
   const val = (k: string) => get(k)?.value ?? null;
   const imgs: ReviewImage[] = (get("images")?.references?.nodes || [])
-    .filter((n: any) => n?.image?.url)
-    .map((n: any) => ({ id: n.id, url: n.image.url, alt: n.alt || "" }));
+    .map((n: any) => {
+      if (n?.image?.url) return { id: n.id, url: n.image.url, alt: n.alt || "", kind: "image" as const };
+      const src = (n?.sources || []).find((x: any) => /mp4/.test(x.mimeType || "")) || (n?.sources || [])[0];
+      if (src?.url) return { id: n.id, url: src.url, alt: n.alt || "", kind: "video" as const, poster: n.preview?.image?.url || "" };
+      return null;
+    })
+    .filter(Boolean) as ReviewImage[];
+  const av = get("avatar")?.reference;
+  const avatar = av?.image?.url ? { id: av.id, url: av.image.url } : null;
   let replies: ReviewComment[] = [];
   try { replies = normalizeComments(JSON.parse(val("replies") || "[]")); } catch { replies = []; }
   return {
@@ -167,6 +190,7 @@ function fromMetaobject(shop: string, m: any) {
     source: val("source") || "Website",
     orderId: val("order_id") || null,
     images: JSON.stringify(imgs),
+    avatar: avatar ? JSON.stringify(avatar) : null,
     replies: JSON.stringify(replies),
     helpful: parseInt(val("helpful") || "0", 10),
     featured: val("featured") === "true",
@@ -241,6 +265,7 @@ export async function patchReview(admin: Admin, shop: string, id: string, patch:
     productId: cur.productId, rating: cur.rating, title: cur.title, body: cur.body, author: cur.author,
     location: cur.location, status: cur.status, verified: cur.verified, source: cur.source, orderId: cur.orderId,
     images: JSON.parse(cur.images), replies: JSON.parse(cur.replies), helpful: cur.helpful, featured: cur.featured,
+    avatar: cur.avatar ? JSON.parse(cur.avatar) : null,
     createdAt: cur.createdAt.toISOString(), ...patch,
   };
   return updateReview(admin, shop, id, merged);
@@ -369,9 +394,11 @@ const LEGACY_PREVIEW = 10;
 export function legacyReview(r: any, helpfulByCustomerIds: string[] = [], likedBy: Record<string, string[]> = {}) {
   const images: ReviewImage[] = typeof r.images === "string" ? JSON.parse(r.images) : r.images || [];
   const comments = normalizeComments(typeof r.replies === "string" ? JSON.parse(r.replies) : r.replies || []);
+  const visible = (c: ReviewComment) => c.status === "approved";
   const mapC = (c: ReviewComment): any => ({
     id: c.id,
     name: c.name,
+    avatar: c.avatar || null,
     text: c.text,
     date: c.date,
     type: c.type,
@@ -380,8 +407,10 @@ export function legacyReview(r: any, helpfulByCustomerIds: string[] = [], likedB
     likeCount: c.likeCount,
     likedByCustomerIds: likedBy[c.id] || [],
     parentCommentId: c.parentCommentId || null,
-    replies: (c.replies || []).map(mapC),
+    replies: (c.replies || []).filter(visible).map(mapC),
   });
+  let avatarUrl: string | null = null;
+  try { avatarUrl = r.avatar ? (typeof r.avatar === "string" ? JSON.parse(r.avatar) : r.avatar)?.url || null : null; } catch { avatarUrl = null; }
   return {
     id: String(r.id).split("/").pop(),
     productId: `gid://shopify/Product/${r.productId}`,
@@ -397,9 +426,10 @@ export function legacyReview(r: any, helpfulByCustomerIds: string[] = [], likedB
     helpfulCount: r.helpful,
     likeCount: r.helpful,
     helpfulByCustomerIds,
-    images: images.filter((i) => i.url).map((i) => i.url),
-    videos: [],
-    comments: comments.map(mapC),
+    avatar: avatarUrl,
+    images: images.filter((i) => i.url && i.kind !== "video").map((i) => i.url),
+    videos: images.filter((i) => i.url && i.kind === "video").map((i) => i.url),
+    comments: comments.filter(visible).map(mapC),
   };
 }
 
@@ -449,7 +479,7 @@ export async function addComment(
   admin: Admin,
   shop: string,
   reviewId: string,
-  input: { name: string; text: string; type: "store" | "customer"; customerId?: string | null; verified?: boolean; id?: string },
+  input: { name: string; text: string; type: "store" | "customer"; customerId?: string | null; verified?: boolean; id?: string; avatar?: string | null },
   parentId: string | null = null,
 ) {
   const cur = await prisma.review.findUnique({ where: { id: reviewId } });
@@ -464,6 +494,7 @@ export async function addComment(
     type: input.type,
     status: "approved",
     customerId: input.customerId || null,
+    avatar: input.avatar || null,
     verified: !!input.verified,
     likeCount: 0,
     parentCommentId: parentId,
@@ -476,6 +507,27 @@ export async function addComment(
   } else {
     tree.push(node);
   }
+  await patchReview(admin, shop, reviewId, { replies: tree });
+  return node;
+}
+
+/** Edit a comment/reply from the admin: text, name, picture, or hide/show it. */
+export async function updateComment(
+  admin: Admin,
+  shop: string,
+  reviewId: string,
+  commentId: string,
+  patch: { text?: string; name?: string; avatar?: string | null; status?: "approved" | "hidden" },
+) {
+  const cur = await prisma.review.findUnique({ where: { id: reviewId } });
+  if (!cur || cur.shop !== shop) throw new Error("Review not found");
+  const tree = normalizeComments(JSON.parse(cur.replies));
+  const node = findNode(tree, commentId);
+  if (!node) throw new Error("Comment not found");
+  if (patch.text !== undefined) node.text = patch.text.slice(0, 2000);
+  if (patch.name !== undefined && patch.name.trim()) node.name = patch.name.trim().slice(0, 60);
+  if (patch.avatar !== undefined) node.avatar = patch.avatar;
+  if (patch.status) node.status = patch.status;
   await patchReview(admin, shop, reviewId, { replies: tree });
   return node;
 }
@@ -562,6 +614,46 @@ export async function resyncAll(admin: Admin, shop: string) {
 }
 
 /* ───────────────────────── photos upload ───────────────────────── */
+/** Photos and videos (videos can take a little longer: Shopify processes them). */
+export async function uploadMedia(admin: Admin, files: File[]): Promise<ReviewImage[]> {
+  const list = files.filter((f) => f && f.size > 0 && /^(image|video)\//.test(f.type)).slice(0, 10);
+  const imgs = list.filter((f) => f.type.startsWith("image/"));
+  const vids = list.filter((f) => f.type.startsWith("video/")).slice(0, 3);
+  const out: ReviewImage[] = (await uploadImages(admin, imgs)).map((i) => ({ ...i, kind: "image" as const }));
+  if (!vids.length) return out;
+  if (vids.some((v) => v.size > 100 * 1024 * 1024)) throw new Error("Each video must be under 100 MB");
+  const staged = await gql(admin, `mutation($input: [StagedUploadInput!]!) {
+    stagedUploadsCreate(input: $input) { stagedTargets { url resourceUrl parameters { name value } } userErrors { message } } }`, {
+    input: vids.map((f) => ({ filename: f.name || "review.mp4", mimeType: f.type, resource: "VIDEO", httpMethod: "POST", fileSize: String(f.size) })),
+  });
+  const targets = staged.stagedUploadsCreate.stagedTargets;
+  await Promise.all(targets.map(async (t: any, i: number) => {
+    const form = new FormData();
+    t.parameters.forEach((p: any) => form.append(p.name, p.value));
+    form.append("file", vids[i]);
+    const up = await fetch(t.url, { method: "POST", body: form });
+    if (!up.ok) throw new Error("Video upload failed");
+  }));
+  const created = await gql(admin, `mutation($files: [FileCreateInput!]!) {
+    fileCreate(files: $files) { files { id } userErrors { message } } }`, {
+    files: targets.map((t: any) => ({ originalSource: t.resourceUrl, contentType: "VIDEO", alt: "Customer review video" })),
+  });
+  const ids: string[] = created.fileCreate.files.map((f: any) => f.id);
+  for (let attempt = 0; attempt < 40; attempt++) {
+    const d = await gql(admin, `query($ids: [ID!]!) { nodes(ids: $ids) { ... on Video { id fileStatus sources { url mimeType } preview { image { url } } } } }`, { ids });
+    const ready = d.nodes.filter((n: any) => n?.sources?.length);
+    if (ready.length === ids.length) {
+      return out.concat(ready.map((n: any) => {
+        const src = n.sources.find((x: any) => /mp4/.test(x.mimeType || "")) || n.sources[0];
+        return { id: n.id, url: src.url, alt: "", kind: "video" as const, poster: n.preview?.image?.url || "" };
+      }));
+    }
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+  // still processing: keep the file ids; the next sync (webhook) fills in the URLs
+  return out.concat(ids.map((id) => ({ id, url: "", alt: "", kind: "video" as const })));
+}
+
 export async function uploadImages(admin: Admin, files: File[]): Promise<ReviewImage[]> {
   const imgs = files.filter((f) => f && f.size > 0 && /^image\//.test(f.type)).slice(0, 6);
   if (!imgs.length) return [];
