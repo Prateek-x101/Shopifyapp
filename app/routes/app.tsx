@@ -33,6 +33,7 @@ export default function App() {
         <s-link href="/app/reviews">Reviews</s-link>
         <s-link href="/app/comments">Comments</s-link>
         <s-link href="/app/products">Products</s-link>
+        <s-link href="/app/settings">Settings</s-link>
       </s-app-nav>
       <Outlet />
     </AppProvider>

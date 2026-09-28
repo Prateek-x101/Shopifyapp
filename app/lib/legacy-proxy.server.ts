@@ -9,6 +9,7 @@
  * The widget sends the logged-in customer through Shopify's signed proxy parameter `logged_in_customer_id`.
  */
 import prisma from "../db.server";
+import { customerFromToken, googleLogin } from "./google-login.server";
 import {
   addComment,
   createReview,
@@ -47,7 +48,7 @@ export async function legacyGet(shop: string, sp: URLSearchParams, admin: Admin 
   if (action === "get_reviews_page") {
     if (!productId) return json({ success: false, error: "productId required" }, { status: 400 });
     const page = Math.max(1, parseInt(sp.get("page") || "1", 10) || 1);
-    const customerId = num(sp.get("logged_in_customer_id"));
+    const customerId = num(sp.get("logged_in_customer_id")) || customerFromToken(sp.get("vw_t"), shop);
     // a logged-in shopper also gets their own helpful/like marks, so that answer must not be shared
     let votes = null;
     if (customerId && admin) {
@@ -98,8 +99,20 @@ function dataUrlToFile(dataUrl: string, i: number): File | null {
 
 export async function legacyPost(admin: Admin, shop: string, sp: URLSearchParams, body: any, ip: string) {
   const actionType = String(body?.actionType || "");
-  const customerId = num(sp.get("logged_in_customer_id"));
+  // Shopify login (signed proxy param) first; otherwise the widget's "Continue with Google" token
+  const customerId = num(sp.get("logged_in_customer_id")) || customerFromToken(body?.appToken, shop);
   const productId = num(body?.productId);
+
+  /* ── Continue with Google ── */
+  if (actionType === "google_login") {
+    if (limited(`g:${ip}`, 10)) return json({ success: false, error: "Too many attempts. Please wait a bit." }, { status: 429 });
+    try {
+      const r = await googleLogin(admin, shop, String(body.credential || ""));
+      return json({ success: true, ...r });
+    } catch (e: any) {
+      return json({ success: false, error: e?.message || "Google sign-in failed" }, { status: 400 });
+    }
+  }
 
   /* ── new review ── */
   if (actionType === "submit_review") {
