@@ -343,8 +343,18 @@ export default function EditReview() {
 
       {!isNew && (
         <s-section slot="aside" heading={`Comments & replies (${countComments(r.replies || [])})`}>
-          <Thread review={r} shopName={shopName} people={people} />
+          <ThreadSummary review={r} />
         </s-section>
+      )}
+
+      {!isNew && (
+        <s-modal id="thread-modal" heading={`Conversation · ${r.author}`} size="large">
+          <ReviewHeader review={r} />
+          <s-divider />
+          <div style={{ paddingTop: 8 }}>
+            <Thread review={r} shopName={shopName} people={people} />
+          </div>
+        </s-modal>
       )}
     </s-page>
   );
@@ -353,6 +363,65 @@ export default function EditReview() {
 export const headers: HeadersFunction = (headersArgs) => boundary.headers(headersArgs);
 
 /* ───────────────────────── comments panel ───────────────────────── */
+
+/** Right column: counts, the two latest messages and a button that opens the full conversation. */
+function ThreadSummary({ review }: { review: any }) {
+  const all: ReviewComment[] = [];
+  const walk = (list: ReviewComment[]) => list.forEach((c) => { all.push(c); walk(c.replies || []); });
+  walk(review.replies || []);
+  const latest = [...all].sort((a, b) => Date.parse(b.date) - Date.parse(a.date)).slice(0, 2);
+  const hidden = all.filter((c) => c.status === "hidden").length;
+
+  return (
+    <s-stack gap="base">
+      {all.length === 0 ? (
+        <s-text color="subdued">No comments yet. Start the conversation as the store or as a customer.</s-text>
+      ) : (
+        <>
+          <s-stack direction="inline" gap="small-200">
+            {review.needsReply && <s-badge tone="critical">Needs reply</s-badge>}
+            {hidden > 0 && <s-badge tone="warning">{hidden} hidden</s-badge>}
+          </s-stack>
+          {latest.map((c) => (
+            <s-stack key={c.id} direction="inline" gap="small-200" alignItems="start">
+              <Who name={c.name} avatar={c.avatar} store={c.type === "store"} size="small-200" />
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <s-text type="strong">{c.name}</s-text>
+                <div style={{ display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden", color: "#4a4a4a", fontSize: 13, lineHeight: "18px" }}>
+                  {c.text}
+                </div>
+              </div>
+            </s-stack>
+          ))}
+        </>
+      )}
+      <s-button variant="primary" icon="chat" commandFor="thread-modal" command="--show">
+        {all.length ? `Open conversation (${all.length})` : "Write a comment"}
+      </s-button>
+    </s-stack>
+  );
+}
+
+/** Top of the conversation popup: the review itself. */
+function ReviewHeader({ review }: { review: any }) {
+  return (
+    <div style={{ paddingBottom: 12 }}>
+      <s-stack direction="inline" gap="base" alignItems="start">
+        <Who name={review.author} avatar={review.avatar?.url} size="base" />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <s-stack gap="small-300">
+            <s-stack direction="inline" gap="small-200" alignItems="center">
+              <s-text type="strong">{review.author}</s-text>
+              <span style={{ color: "#e0261b", letterSpacing: 1 }}>{"★".repeat(review.rating)}<span style={{ color: "#d9d9d9" }}>{"★".repeat(5 - review.rating)}</span></span>
+              {review.location && <s-text color="subdued">{review.location}</s-text>}
+            </s-stack>
+            <s-text>{review.body}</s-text>
+          </s-stack>
+        </div>
+      </s-stack>
+    </div>
+  );
+}
 
 function Thread({ review, shopName, people }: { review: any; shopName: string; people: { name: string; avatar: string | null }[] }) {
   const [target, setTarget] = useState<{ id: string; name: string } | null>(null);
