@@ -1,12 +1,13 @@
 import type { ActionFunctionArgs, HeadersFunction, LoaderFunctionArgs } from "react-router";
 import { useFetcher, useLoaderData, useNavigate, useSearchParams } from "react-router";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { deleteReview, gql, listReviews, patchReview } from "../lib/reviews.server";
 import { countComments, normalizeComments } from "../lib/reviews.shared";
+import { ReviewHeader, Thread, initials, peopleOf } from "../components/review-thread";
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
@@ -15,7 +16,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const sp = url.searchParams;
 
   const [prod, list, counts] = await Promise.all([
-    gql(admin, `query($id: ID!) { product(id: $id) { id title handle onlineStoreUrl featuredMedia { preview { image { url } } } } }`, {
+    gql(admin, `query($id: ID!) { product(id: $id) { id title handle onlineStoreUrl featuredMedia { preview { image { url } } } } shop { name } }`, {
       id: `gid://shopify/Product/${productId}`,
     }),
     listReviews({
@@ -41,6 +42,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       image: prod.product.featuredMedia?.preview?.image?.url || "",
       url: prod.product.onlineStoreUrl,
     },
+    shopName: prod.shop.name as string,
     byStatus,
     list: {
       ...list,
@@ -55,7 +57,9 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
         verified: r.verified,
         source: r.source,
         featured: r.featured,
-        images: JSON.parse(r.images) as { url: string }[],
+        images: (JSON.parse(r.images) as { url: string; kind?: string }[]).filter((i) => i.url && i.kind !== "video"),
+        avatar: r.avatar ? (JSON.parse(r.avatar) as { id: string; url: string }) : null,
+        thread: normalizeComments(JSON.parse(r.replies)),
         replies: countComments(normalizeComments(JSON.parse(r.replies))),
         needsReply: r.needsReply,
         createdAt: r.createdAt.toISOString(),
@@ -137,7 +141,10 @@ function RowActions({ r }: { r: any }) {
 }
 
 export default function ProductReviews() {
-  const { product, byStatus, list } = useLoaderData<typeof loader>();
+  const { product, shopName, byStatus, list } = useLoaderData<typeof loader>();
+  const [openId, setOpenId] = useState<string | null>(null);
+  const open = list.rows.find((r) => r.id === openId) || null;
+  const openReview = open ? { ...open, replies: open.thread } : null;
   const [params] = useSearchParams();
   const navigate = useNavigate();
   const status = params.get("status") || "all";
@@ -229,16 +236,25 @@ export default function ProductReviews() {
                       <s-stack direction="inline" gap="small-200" alignItems="center">
                         {r.images.slice(0, 4).map((img, i) => <s-thumbnail key={i} src={img.url} alt="Review photo" size="base" />)}
                         {r.images.length > 4 && <s-text color="subdued">+{r.images.length - 4}</s-text>}
-                        {r.replies > 0 && <s-badge icon="chat">{r.replies} comment{r.replies > 1 ? "s" : ""}</s-badge>}
                         {r.needsReply && <s-badge tone="critical">Needs reply</s-badge>}
                       </s-stack>
                     )}
+                    <s-stack direction="inline">
+                      <s-button variant="tertiary" icon="chat" commandFor="list-thread-modal" command="--show" onClick={() => setOpenId(r.id)}>
+                        {r.replies > 0 ? `${r.replies} comment${r.replies > 1 ? "s" : ""}` : "Reply"}
+                      </s-button>
+                    </s-stack>
                   </s-stack>
                 </s-table-cell>
                 <s-table-cell>
                   <s-stack gap="small-300">
-                    <s-text>{r.author}</s-text>
-                    {r.location && <s-text color="subdued">{r.location}</s-text>}
+                    <s-stack direction="inline" gap="small-200" alignItems="center">
+                      <s-avatar size="small" initials={initials(r.author)} alt={r.author} {...(r.avatar?.url ? { src: r.avatar.url } : {})} />
+                      <s-stack gap="none">
+                        <s-text>{r.author}</s-text>
+                        {r.location && <s-text color="subdued">{r.location}</s-text>}
+                      </s-stack>
+                    </s-stack>
                     <s-stack direction="inline" gap="small-300">
                       {r.verified && <s-badge tone="success" icon="check">Verified</s-badge>}
                       <s-badge>{r.source}</s-badge>
@@ -262,6 +278,25 @@ export default function ProductReviews() {
           </s-box>
         )}
       </s-section>
+      <s-modal
+        id="list-thread-modal"
+        heading={open ? `Conversation · ${open.author}` : "Conversation"}
+        size="large"
+        onHide={() => setOpenId(null)}
+      >
+        {openReview && (
+          <div key={openReview.id}>
+            <ReviewHeader review={openReview} />
+            <Thread
+              review={openReview}
+              shopName={shopName}
+              people={peopleOf(openReview)}
+              actionUrl={`/app/reviews/${product.id}/${encodeURIComponent(openReview.id.split("/").pop() || "")}`}
+            />
+          </div>
+        )}
+      </s-modal>
+
       <s-text color="subdued">
         Showing page {list.page} of {list.pages} · {list.total} review{list.total === 1 ? "" : "s"}
       </s-text>
