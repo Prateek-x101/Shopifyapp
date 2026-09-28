@@ -517,7 +517,7 @@ export async function updateComment(
   shop: string,
   reviewId: string,
   commentId: string,
-  patch: { text?: string; name?: string; avatar?: string | null; status?: "approved" | "hidden" },
+  patch: { text?: string; name?: string; avatar?: string | null; status?: "approved" | "hidden"; likeCount?: number },
 ) {
   const cur = await prisma.review.findUnique({ where: { id: reviewId } });
   if (!cur || cur.shop !== shop) throw new Error("Review not found");
@@ -528,6 +528,7 @@ export async function updateComment(
   if (patch.name !== undefined && patch.name.trim()) node.name = patch.name.trim().slice(0, 60);
   if (patch.avatar !== undefined) node.avatar = patch.avatar;
   if (patch.status) node.status = patch.status;
+  if (patch.likeCount !== undefined && Number.isFinite(patch.likeCount)) node.likeCount = Math.max(0, Math.min(99999, Math.round(patch.likeCount)));
   await patchReview(admin, shop, reviewId, { replies: tree });
   return node;
 }
