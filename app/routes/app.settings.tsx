@@ -16,7 +16,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     getModeration(admin),
     widgetStatus(admin).catch((e: any) => ({ theme: "", found: false, missing: [] as string[], error: String(e?.message || e) })),
   ]);
-  return { google_login: s.google_login, google_client_id: s.google_client_id, shop: session.shop, mod, widget };
+  return { google_login: s.google_login, google_client_id: s.google_client_id, login_mode: s.login_mode, shop: session.shop, mod, widget };
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -55,13 +55,17 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
   }
   const clientId = String(fd.get("google_client_id") || "").trim();
-  const on = fd.get("google_login") === "on";
+  const mode = fd.get("login_mode") === "widget" ? "widget" : "shopify";
+  const on = mode === "widget" && fd.get("google_login") === "on";
   if (on && !/^[\w-]+\.apps\.googleusercontent\.com$/.test(clientId)) {
     return { ok: false, message: "Paste the Client ID from Google Cloud (it ends with .apps.googleusercontent.com)." };
   }
   try {
-    const saved = await saveSettings(admin, { google_login: on, google_client_id: clientId });
-    return { ok: true, message: saved.google_login ? "Saved. Google sign-in is on." : "Saved." };
+    await saveSettings(admin, { google_login: on, google_client_id: clientId, login_mode: mode });
+    return {
+      ok: true,
+      message: mode === "shopify" ? "Saved. The widget uses your store's sign-in (with Google)." : on ? "Saved. Widget-only Google sign-in is on." : "Saved.",
+    };
   } catch (e: any) {
     return { ok: false, message: e?.message || "Could not save" };
   }
@@ -103,6 +107,7 @@ export default function Settings() {
     if (fixFetcher.data?.message) shopify.toast.show(fixFetcher.data.message, { isError: !fixFetcher.data.ok });
   }, [fixFetcher.data, shopify]);
   const [on, setOn] = useState(data.google_login);
+  const [mode, setMode] = useState<string>(data.login_mode);
   const busy = fetcher.state !== "idle";
 
   useEffect(() => {
@@ -115,25 +120,43 @@ export default function Settings() {
   return (
     <s-page heading="Settings">
       <fetcher.Form method="post">
-        <s-section heading="Sign in with Google">
+        <s-section heading="Customer login">
           <s-stack gap="base">
-            <s-paragraph>
-              Lets shoppers post reviews, comments and helpful votes with one tap using their Google account. Their Shopify
-              customer (same email) is found or created, so orders still count for “Verified buyer”.
-            </s-paragraph>
-            <s-checkbox
-              name="google_login"
-              label="Show “Continue with Google” in the review widget"
-              checked={on}
-              onChange={(e: any) => setOn(!!e.currentTarget.checked)}
-            />
-            <s-text-field
-              label="Google Client ID"
-              name="google_client_id"
-              defaultValue={data.google_client_id}
-              placeholder="1234567890-abc123.apps.googleusercontent.com"
-              details="Public ID, not a password. Create it once in Google Cloud (steps on the right)."
-            />
+            <input type="hidden" name="login_mode" value={mode} />
+            <s-choice-list label="How shoppers log in from the review widget" name="login_mode_choice" values={[mode]} onChange={(e: any) => setMode(e.currentTarget.values?.[0] || "shopify")}>
+              <s-choice value="shopify">
+                Store account (recommended)
+                <s-text slot="details">
+                  The widget's log-in sheet opens your store's own sign-in — with “Continue with Google” (Settings → Customer accounts →
+                  Google). One login for reviews, orders and checkout; the shopper comes back to the same review.
+                </s-text>
+              </s-choice>
+              <s-choice value="widget">
+                Widget only
+                <s-text slot="details">
+                  The widget signs shoppers in with Google by itself (needs the Client ID below). They are not logged in to the store
+                  account or checkout.
+                </s-text>
+              </s-choice>
+            </s-choice-list>
+            {mode === "widget" && (
+              <>
+                <s-checkbox
+                  name="google_login"
+                  label="Show “Continue with Google” in the review widget"
+                  checked={on}
+                  onChange={(e: any) => setOn(!!e.currentTarget.checked)}
+                />
+                <s-text-field
+                  label="Google Client ID"
+                  name="google_client_id"
+                  defaultValue={data.google_client_id}
+                  placeholder="1234567890-abc123.apps.googleusercontent.com"
+                  details="Public ID, not a password."
+                />
+              </>
+            )}
+            {mode === "shopify" && <input type="hidden" name="google_client_id" value={data.google_client_id} />}
             <s-stack direction="inline" justifyContent="end">
               <s-button type="submit" variant="primary" {...(busy ? { loading: true } : {})}>Save</s-button>
             </s-stack>

@@ -1,6 +1,10 @@
-/* VWLOGIN_V2 — installed by the Engine app (Settings → Storefront widget → Repair widget). Edit in the app repo. */
+/* VWLOGIN_V3 — installed by the Engine app (Settings → Storefront widget → Repair widget). Edit in the app repo. */
 /**
- * "Continue with Google" + profile for the review widget.
+ * Log in for the review widget (+ profile).
+ * - Store-account mode (Engine → Settings → Customer login, default): the log-in sheet sends the shopper to the store's
+ *   own sign-in (Shopify customer accounts, "Continue with Google" there) and back to the same review. One login for
+ *   the widget, orders and checkout.
+ * - Widget-only mode: "Continue with Google" right in the sheet (below).
  * - Loads before review-widget.js. A Google sign-in from this browser (30 days) presents the shopper to the widget
  *   as a logged-in customer, and its token rides along on every call to the app proxy (/apps/engine).
  * - Signing in does not reload the page: the widget switches to the new customer and the reply that was typed is
@@ -13,7 +17,9 @@
     var PROXY = window.__arwProxyBase || '/apps/engine';
     var KEY = 'vw_glogin';
     var RESTORE = 'vw_restore';
-    var enabled = !!(cfg.enabled && cfg.clientId);
+    var shopifyMode = cfg.mode !== 'widget';
+    var googleWidget = !shopifyMode && !!(cfg.enabled && cfg.clientId);
+    var enabled = shopifyMode || googleWidget; // the widget shows this sheet instead of jumping to the login page
 
     function read() {
         try {
@@ -23,7 +29,8 @@
         } catch (e) { /* storage blocked */ }
         return null;
     }
-    var session = read();
+    if (shopifyMode) { try { localStorage.removeItem(KEY); } catch (e) { /* storage blocked */ } }
+    var session = shopifyMode ? null : read(); // store-account mode: only the real store login counts
     var shopifyCustomer = window.__arwCustomer && window.__arwCustomer.via !== 'google' ? window.__arwCustomer : null;
 
     function asCustomer(s) {
@@ -118,6 +125,8 @@
             '.vwl-g{display:flex;justify-content:center;min-height:44px;margin-bottom:10px}',
             '.vwl-or{display:flex;align-items:center;gap:10px;margin:6px 0 10px;color:#9a9a9a;font-size:12px}',
             '.vwl-or:before,.vwl-or:after{content:"";flex:1;height:1px;background:#eee}',
+            '.vwl-google{display:flex;align-items:center;justify-content:center;gap:10px;height:44px;border:1px solid #dadce0;border-radius:22px;color:#141414;font-size:14px;font-weight:500;text-decoration:none;margin-bottom:10px}',
+            '.vwl-google svg{width:18px;height:18px}',
             '.vwl-email{display:block;height:44px;line-height:44px;border:1px solid #dadce0;border-radius:22px;color:#141414;font-size:14px;font-weight:500;text-decoration:none}',
             '.vwl-msg{margin:10px 0 0;font-size:12.5px;color:#606060}.vwl-msg.is-bad{color:#b3261e}',
             '.vwl-note{margin:12px 0 0!important;font-size:11.5px!important;color:#9a9a9a!important}',
@@ -251,9 +260,26 @@
         }).catch(function (e) { msg(e.message || 'Google sign-in failed', true); });
     }
 
+    var G_ICON = '<svg viewBox="0 0 48 48" aria-hidden="true"><path fill="#EA4335" d="M24 9.5c3.5 0 6.6 1.2 9 3.6l6.7-6.7C35.6 2.4 30.2 0 24 0 14.6 0 6.6 5.4 2.7 13.2l7.8 6.1C12.4 13.6 17.7 9.5 24 9.5z"/><path fill="#4285F4" d="M46.1 24.5c0-1.6-.1-3.1-.4-4.5H24v9h12.4c-.5 2.9-2.2 5.3-4.6 6.9l7.5 5.8c4.4-4 6.8-10 6.8-17.2z"/><path fill="#FBBC05" d="M10.5 28.7c-.5-1.4-.8-3-.8-4.7s.3-3.2.8-4.7l-7.8-6.1C1 16.6 0 20.2 0 24s1 7.4 2.7 10.8l7.8-6.1z"/><path fill="#34A853" d="M24 48c6.5 0 11.9-2.1 15.9-5.8l-7.5-5.8c-2.1 1.4-4.8 2.3-8.4 2.3-6.3 0-11.6-4.1-13.5-9.8l-7.8 6.1C6.6 42.6 14.6 48 24 48z"/></svg>';
+
     function build() {
         if (sheet) return sheet;
         sheet = makeSheet('Log in');
+        if (shopifyMode) {
+            sheet.innerHTML =
+                '<div class="vwl-bar"></div>' +
+                '<button type="button" class="vwl-x" aria-label="Close">&times;</button>' +
+                '<h3>Log in to continue</h3>' +
+                '<p>Use your store account to post reviews, reply and mark reviews helpful — the same login for your orders and checkout.</p>' +
+                '<a class="vwl-google" href="#">' + G_ICON + '<span>Continue with Google</span></a>' +
+                '<div class="vwl-or">or</div>' +
+                '<a class="vwl-email" href="#">Log in with email</a>' +
+                '<div class="vwl-msg" hidden></div>' +
+                '<p class="vwl-note">You will come back to this page after logging in.</p>';
+            sheet.querySelector('.vwl-x').addEventListener('click', sheet.__close);
+            sheet.querySelectorAll('.vwl-google, .vwl-email').forEach(function (a) { a.addEventListener('click', remember); });
+            return sheet;
+        }
         sheet.innerHTML =
             '<div class="vwl-bar"></div>' +
             '<button type="button" class="vwl-x" aria-label="Close">&times;</button>' +
@@ -269,10 +295,20 @@
         return sheet;
     }
 
+    function loginUrl(ret) {
+        return '/customer_authentication/login?return_to=' + encodeURIComponent(ret);
+    }
+
     function open(returnUrl) {
         var ret = returnUrl || (location.pathname + location.search);
-        if (!enabled) { remember(); location.href = '/account/login?return_url=' + encodeURIComponent(ret); return; }
+        if (!enabled) { remember(); location.href = loginUrl(ret); return; }
         build();
+        if (shopifyMode) {
+            sheet.querySelectorAll('.vwl-google, .vwl-email').forEach(function (a) { a.setAttribute('href', loginUrl(ret)); });
+            msg('');
+            sheet.__show();
+            return;
+        }
         sheet.querySelector('.vwl-email').setAttribute('href', '/account/login?return_url=' + encodeURIComponent(ret));
         msg('');
         sheet.__show();
@@ -287,7 +323,7 @@
     function signOut() {
         try { localStorage.removeItem(KEY); } catch (e) { /* ignore */ }
         if (session) { remember(); location.reload(); return; }
-        location.href = '/account/logout';
+        location.href = '/account/logout'; // store login (Shopify signs the customer out)
     }
 
     /* ── profile ── */
@@ -361,5 +397,5 @@
     });
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', setMe); else setMe();
 
-    window.VWLogin = { enabled: enabled, open: open, signOut: signOut, profile: profile, session: session, shopify: shopifyCustomer, version: 2 };
+    window.VWLogin = { enabled: enabled, mode: shopifyMode ? 'shopify' : 'widget', open: open, signOut: signOut, profile: profile, session: session, shopify: shopifyCustomer, version: 3 };
 })();

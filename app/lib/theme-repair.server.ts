@@ -99,11 +99,22 @@ const WIDGET_CSS: Patch[] = [
   },
 ];
 
+const same = (a: string, b: string) => a.replace(/\r\n/g, "\n").trim() === b.replace(/\r\n/g, "\n").trim();
 const GOOGLE_LOGIN: Patch[] = [
   {
-    label: "Login: stays on the same review, profile with orders",
-    applied: (s) => s.includes("VWLOGIN_V2") && s.length >= GOOGLE_LOGIN_JS.length - 50 && s.includes("version: 2"),
+    label: "Login: one login with the store account (Google), back to the same review",
+    applied: (s) => same(s, GOOGLE_LOGIN_JS),
     apply: () => GOOGLE_LOGIN_JS,
+  },
+];
+
+const WIDGET_LIQUID: Patch[] = [
+  {
+    // tell the login script which log-in to use (Engine → Settings → Customer login)
+    label: "Login: uses the store sign-in chosen in Settings",
+    applied: (s) => s.includes("vw_app_settings.login_mode"),
+    apply: (s) =>
+      swap(s, /window\.__vwGoogle\s*=\s*\{\s*/, (m) => m[0] + "mode: {{ vw_app_settings.login_mode | default: 'shopify' | json }}, "),
   },
 ];
 
@@ -111,6 +122,7 @@ const FILES: Record<string, Patch[]> = {
   "assets/review-widget.js": WIDGET_JS,
   "assets/review-widget.css": WIDGET_CSS,
   "assets/engine-google-login.js": GOOGLE_LOGIN,
+  "sections/engine-review-widget.liquid": WIDGET_LIQUID,
 };
 
 async function mainTheme(admin: Admin) {
