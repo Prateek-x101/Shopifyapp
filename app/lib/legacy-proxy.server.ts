@@ -10,6 +10,7 @@
  */
 import prisma from "../db.server";
 import { customerFromToken, googleLogin } from "./google-login.server";
+import { getModeration, isAbusive } from "./moderation.server";
 import {
   addComment,
   createReview,
@@ -123,10 +124,17 @@ export async function legacyPost(admin: Admin, shop: string, sp: URLSearchParams
     if (!productId || !(rating >= 1 && rating <= 5) || text.length < 3) {
       return json({ success: false, error: "Please add a star rating and a few words." }, { status: 400 });
     }
-    if (body.requireLoginToReview && !customerId) {
-      return json({ success: false, error: "Please log in to write a review." }, { status: 401 });
+    const mod = await getModeration(admin, shop);
+    // only people who ordered this product may review it (setting "Only buyers can review", on by default)
+    if ((mod.buyers_only || body.requireLoginToReview) && !customerId) {
+      return json({
+        success: false,
+        error: mod.buyers_only
+          ? "Only customers who bought this product can review it. Please log in with the account you ordered with."
+          : "Please log in to write a review.",
+      }, { status: 401 });
     }
-    let verified = false;
+    const verified = true; // every review shows "Verified buyer" by default
     let orderId: string | null = null;
     if (customerId) {
       try {
@@ -134,12 +142,17 @@ export async function legacyPost(admin: Admin, shop: string, sp: URLSearchParams
         if (!name && info.name) name = info.name;
         const delivered = info.orders.find((o: any) => o.displayFulfillmentStatus === "FULFILLED");
         const hit = delivered || info.orders[0];
+        if (mod.buyers_only && !hit) {
+          return json({ success: false, error: "Only customers who bought this product can review it. We couldn't find an order of this product on your account." }, { status: 403 });
+        }
         if (body.requireDeliveredOrderForReview && !delivered) {
           return json({ success: false, error: "You can review this product after your order is delivered." }, { status: 403 });
         }
-        if (hit) { verified = true; orderId = hit.name; }
+        if (hit) orderId = hit.name;
       } catch {
-        if (body.requireDeliveredOrderForReview) return json({ success: false, error: "Could not check your order. Please try again." }, { status: 503 });
+        if (mod.buyers_only || body.requireDeliveredOrderForReview) {
+          return json({ success: false, error: "Could not check your order. Please try again." }, { status: 503 });
+        }
       }
     }
     if (!name) return json({ success: false, error: "Please add your name." }, { status: 400 });
@@ -168,12 +181,20 @@ export async function legacyPost(admin: Admin, shop: string, sp: URLSearchParams
       verified = info.orders.length > 0;
       if (!name && info.name) name = info.name;
     } catch { /* not verified */ }
+    // abusive words → the comment waits for the admin (Engine → Comments) instead of going live
+    const mod = await getModeration(admin, shop);
+    const flagged = isAbusive(`${name} ${text}`, mod.extra_words);
     const node = await addComment(
       admin, shop, reviewGid(body.reviewId),
-      { name: name || "Customer", text, type: "customer", customerId, verified, id: body.clientId },
+      { name: name || "Customer", text, type: "customer", customerId, verified, id: body.clientId, status: flagged ? "pending" : "approved" },
       actionType === "submit_reply" ? String(body.commentId || "") : null,
     );
-    return json({ success: true, comment: node });
+    return json({
+      success: true,
+      comment: node,
+      pending: flagged,
+      ...(flagged ? { message: "Thanks! Your reply will appear after a quick check." } : {}),
+    });
   }
 
   /* ── helpful on a review ── */

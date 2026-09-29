@@ -58,6 +58,9 @@ export const CV_CSS = `
 .cv-name { color: #1f1f1f; font-weight: 600; font-size: 13px; }
 .cv-tag { font-size: 11px; color: #8a8a8a; }
 .cv-tag.hidden { color: #a86a00; }
+.cv-tag.pending { color: #b42318; }
+.cv-act.approve { color: #1f1f1f; font-weight: 600; border: 1px solid #d4d4d4; margin-right: 4px; }
+.cv-act.approve:hover { background: #303030; color: #fff; border-color: #303030; }
 .cv-text { margin: 2px 0 0; font-size: 13.5px; line-height: 20px; color: #3a3a3a; white-space: pre-wrap; word-wrap: break-word; }
 .cv-node.is-hidden > .cv-row .cv-text, .cv-node.is-hidden > .cv-row .cv-av { opacity: 0.4; }
 
@@ -148,6 +151,7 @@ export function ThreadSummary({ review, modalId = "thread-modal" }: { review: an
   walk(review.replies || []);
   const latest = [...all].sort((a, b) => Date.parse(b.date) - Date.parse(a.date)).slice(0, 2);
   const hidden = all.filter((c) => c.status === "hidden").length;
+  const waiting = all.filter((c) => c.status === "pending").length;
 
   return (
     <s-stack gap="base">
@@ -156,8 +160,9 @@ export function ThreadSummary({ review, modalId = "thread-modal" }: { review: an
         <s-text color="subdued">No comments yet.</s-text>
       ) : (
         <div className="cv">
-          {(review.needsReply || hidden > 0) && (
+          {(review.needsReply || hidden > 0 || waiting > 0) && (
             <div style={{ display: "flex", gap: 6, marginBottom: 4 }}>
+              {waiting > 0 && <s-badge tone="critical">{waiting} waiting for approval</s-badge>}
               {review.needsReply && <s-badge>Needs reply</s-badge>}
               {hidden > 0 && <s-badge>{hidden} hidden</s-badge>}
             </div>
@@ -283,6 +288,7 @@ function Node({ node, depth, onReply, activeId }: { node: ReviewComment; depth: 
   const [editing, setEditing] = useState(false);
   const busy = fetcher.state !== "idle";
   const hidden = node.status === "hidden";
+  const pending = node.status === "pending";
   const store = node.type === "store";
   const kids = node.replies || [];
 
@@ -295,7 +301,7 @@ function Node({ node, depth, onReply, activeId }: { node: ReviewComment; depth: 
   const when = new Date(node.date).toLocaleDateString("en-IN", { day: "numeric", month: "short" });
 
   return (
-    <div className={`cv-node${kids.length ? " has-kids" : ""}${hidden ? " is-hidden" : ""}`}>
+    <div className={`cv-node${kids.length ? " has-kids" : ""}${hidden || pending ? " is-hidden" : ""}`}>
       <div className="cv-row">
         <Avatar name={node.name} src={node.avatar} store={store} size={depth ? "sm" : undefined} />
         <div className="cv-body">
@@ -303,6 +309,7 @@ function Node({ node, depth, onReply, activeId }: { node: ReviewComment; depth: 
             <span className="cv-name">{node.name}</span>
             {store && <span className="cv-tag">· Store</span>}
             {hidden && <span className="cv-tag hidden">· Hidden</span>}
+            {pending && <span className="cv-tag pending">· Waiting for approval</span>}
             <span>· {when}</span>
           </div>
 
@@ -326,12 +333,19 @@ function Node({ node, depth, onReply, activeId }: { node: ReviewComment; depth: 
 
           {!editing && (
             <div className="cv-actions">
+              {pending && (
+                <button type="button" className="cv-act approve" disabled={busy} onClick={() => send({ intent: "comment-status", status: "approved" })}>
+                  Approve
+                </button>
+              )}
               <Likes id={node.id} count={node.likeCount} />
               <button type="button" className={`cv-act${activeId === node.id ? " on" : ""}`} onClick={() => onReply(node)}>Reply</button>
               <button type="button" className="cv-act" onClick={() => setEditing(true)}>Edit</button>
-              <button type="button" className="cv-act" disabled={busy} onClick={() => send({ intent: "comment-status", status: hidden ? "approved" : "hidden" })}>
-                {hidden ? "Show" : "Hide"}
-              </button>
+              {!pending && (
+                <button type="button" className="cv-act" disabled={busy} onClick={() => send({ intent: "comment-status", status: hidden ? "approved" : "hidden" })}>
+                  {hidden ? "Show" : "Hide"}
+                </button>
+              )}
               <button type="button" className="cv-act danger" disabled={busy} onClick={() => { if (confirm("Delete this and its replies?")) send({ intent: "comment-delete" }); }}>
                 Delete
               </button>

@@ -242,7 +242,7 @@ export async function createReview(admin: Admin, shop: string, input: ReviewInpu
   return row;
 }
 
-export async function updateReview(admin: Admin, shop: string, id: string, input: ReviewInput) {
+export async function updateReview(admin: Admin, shop: string, id: string, input: ReviewInput, opts: { skipSummary?: boolean } = {}) {
   const before = await prisma.review.findUnique({ where: { id } });
   const d = await gql(admin, `mutation($id: ID!, $m: MetaobjectUpdateInput!) {
     metaobjectUpdate(id: $id, metaobject: $m) { metaobject { ${MO_FIELDS} } userErrors { field message } } }`, {
@@ -252,13 +252,14 @@ export async function updateReview(admin: Admin, shop: string, id: string, input
   if (errs?.length) throw new Error(errs.map((e: any) => e.message).join(", "));
   const row = fromMetaobject(shop, d.metaobjectUpdate.metaobject);
   await upsertIndex(row);
+  if (opts.skipSummary) return row;
   await recomputeSummary(admin, shop, row.productId);
   if (before && before.productId !== row.productId) await recomputeSummary(admin, shop, before.productId);
   return row;
 }
 
 /** Small patch (status, featured, helpful, replies) without re-sending everything from the UI. */
-export async function patchReview(admin: Admin, shop: string, id: string, patch: Partial<ReviewInput>) {
+export async function patchReview(admin: Admin, shop: string, id: string, patch: Partial<ReviewInput>, opts: { skipSummary?: boolean } = {}) {
   const cur = await prisma.review.findUnique({ where: { id } });
   if (!cur) throw new Error("Review not found");
   const merged: ReviewInput = {
@@ -268,14 +269,14 @@ export async function patchReview(admin: Admin, shop: string, id: string, patch:
     avatar: cur.avatar ? JSON.parse(cur.avatar) : null,
     createdAt: cur.createdAt.toISOString(), ...patch,
   };
-  return updateReview(admin, shop, id, merged);
+  return updateReview(admin, shop, id, merged, opts);
 }
 
-export async function deleteReview(admin: Admin, shop: string, id: string) {
+export async function deleteReview(admin: Admin, shop: string, id: string, opts: { skipSummary?: boolean } = {}) {
   const cur = await prisma.review.findUnique({ where: { id } });
   await gql(admin, `mutation($id: ID!) { metaobjectDelete(id: $id) { deletedId userErrors { message } } }`, { id });
   await prisma.review.deleteMany({ where: { id } });
-  if (cur) await recomputeSummary(admin, shop, cur.productId);
+  if (cur && !opts.skipSummary) await recomputeSummary(admin, shop, cur.productId);
 }
 
 /* ───────────────────────── webhook sync ─────────────────────────
@@ -479,7 +480,10 @@ export async function addComment(
   admin: Admin,
   shop: string,
   reviewId: string,
-  input: { name: string; text: string; type: "store" | "customer"; customerId?: string | null; verified?: boolean; id?: string; avatar?: string | null },
+  input: {
+    name: string; text: string; type: "store" | "customer"; customerId?: string | null; verified?: boolean; id?: string;
+    avatar?: string | null; status?: "approved" | "pending";
+  },
   parentId: string | null = null,
 ) {
   const cur = await prisma.review.findUnique({ where: { id: reviewId } });
@@ -492,7 +496,7 @@ export async function addComment(
     text: input.text.slice(0, 2000),
     date: new Date().toISOString(),
     type: input.type,
-    status: "approved",
+    status: input.status || "approved",
     customerId: input.customerId || null,
     avatar: input.avatar || null,
     verified: !!input.verified,
@@ -768,20 +772,44 @@ export async function listComments(opts: { shop: string; productId?: string; nee
   };
 }
 
-export async function listReviews(opts: {
-  shop: string; productId: string; status?: string; rating?: number; media?: boolean; q?: string; page?: number; perPage?: number;
-  sort?: "newest" | "oldest" | "highest" | "lowest" | "helpful";
-}) {
-  const perPage = Math.min(50, opts.perPage || 20);
-  const page = Math.max(1, opts.page || 1);
+export type ReviewFilters = {
+  shop: string; productId: string; status?: string; rating?: number; media?: boolean; q?: string;
+  customer?: boolean;               // written by shoppers in the widget (not added/imported by the store)
+  from?: string; to?: string;       // YYYY-MM-DD, inclusive (India time)
+  flagged?: boolean;                // has comments waiting for approval
+};
+
+function reviewWhere(opts: ReviewFilters) {
   const where: any = { shop: opts.shop, productId: opts.productId };
   if (opts.status && opts.status !== "all") where.status = opts.status;
   if (opts.rating) where.rating = opts.rating;
   if (opts.media) where.hasMedia = true;
+  if (opts.customer) where.source = "Website";
+  if (opts.flagged) where.replies = { contains: '"status":"pending"' };
+  const day = (s: string | undefined, end: boolean) =>
+    s && /^\d{4}-\d{2}-\d{2}$/.test(s) ? new Date(`${s}T${end ? "23:59:59.999" : "00:00:00"}+05:30`) : null;
+  const from = day(opts.from, false);
+  const to = day(opts.to, true);
+  if (from || to) where.createdAt = { ...(from ? { gte: from } : {}), ...(to ? { lte: to } : {}) };
   if (opts.q) {
     const c = { contains: opts.q, mode: "insensitive" as const };
-    where.OR = [{ body: c }, { author: c }, { title: c }];
+    where.OR = [{ body: c }, { author: c }, { title: c }, { location: c }];
   }
+  return where;
+}
+
+/** Every review id that matches the filters (for "select all" bulk actions). */
+export async function reviewIdsMatching(opts: ReviewFilters, limit = 1000) {
+  const rows = await prisma.review.findMany({ where: reviewWhere(opts), select: { id: true }, orderBy: { createdAt: "desc" }, take: limit });
+  return rows.map((r) => r.id);
+}
+
+export async function listReviews(opts: ReviewFilters & {
+  page?: number; perPage?: number; sort?: "newest" | "oldest" | "highest" | "lowest" | "helpful";
+}) {
+  const perPage = Math.min(50, opts.perPage || 20);
+  const page = Math.max(1, opts.page || 1);
+  const where = reviewWhere(opts);
   const orderBy: any =
     opts.sort === "oldest" ? [{ createdAt: "asc" }] :
     opts.sort === "highest" ? [{ rating: "desc" }, { createdAt: "desc" }] :

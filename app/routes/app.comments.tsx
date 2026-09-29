@@ -1,223 +1,183 @@
-import type { ActionFunctionArgs, HeadersFunction, LoaderFunctionArgs } from "react-router";
+/**
+ * Comments & replies across all products: the approval queue (comments with abusive words wait here),
+ * hidden ones, and the latest activity. Every action posts to the review editor route of that review.
+ */
+import type { HeadersFunction, LoaderFunctionArgs } from "react-router";
 import { useFetcher, useLoaderData, useNavigate, useSearchParams } from "react-router";
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
-import { addComment, gql, listComments, removeComment } from "../lib/reviews.server";
+import { gql } from "../lib/reviews.server";
+import { normalizeComments } from "../lib/reviews.shared";
+import type { ReviewComment } from "../lib/reviews.shared";
+import { initials } from "../components/review-thread";
+
+type Tab = "waiting" | "hidden" | "recent";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
-  const sp = new URL(request.url).searchParams;
-  const view = sp.get("view") || "needs-reply";
-  const productId = sp.get("product") || "";
-  const q = sp.get("q") || "";
-  const page = parseInt(sp.get("page") || "1", 10);
+  const tab = (new URL(request.url).searchParams.get("tab") || "waiting") as Tab;
+  const shop = session.shop;
 
-  const [list, withComments, awaitingTotal, shop] = await Promise.all([
-    listComments({ shop: session.shop, productId: productId || undefined, needsReply: view === "needs-reply", q, page }),
-    prisma.review.groupBy({ by: ["productId"], where: { shop: session.shop, commentCount: { gt: 0 } }, _sum: { commentCount: true } }),
-    prisma.review.count({ where: { shop: session.shop, needsReply: true } }),
-    gql(admin, `{ shop { name } }`),
+  const [waitingCount, hiddenCount] = await Promise.all([
+    prisma.review.count({ where: { shop, replies: { contains: '"status":"pending"' } } }),
+    prisma.review.count({ where: { shop, replies: { contains: '"status":"hidden"' } } }),
   ]);
 
-  const ids = Array.from(new Set([...withComments.map((w) => w.productId), ...list.items.map((i) => i.productId)]));
+  const where: any =
+    tab === "waiting" ? { shop, replies: { contains: '"status":"pending"' } } :
+    tab === "hidden" ? { shop, replies: { contains: '"status":"hidden"' } } :
+    { shop, commentCount: { gt: 0 } };
+  const reviews = await prisma.review.findMany({
+    where,
+    orderBy: { updatedAt: "desc" },
+    take: 150,
+    select: { id: true, productId: true, author: true, body: true, rating: true, replies: true },
+  });
+
+  const items: {
+    reviewId: string; productId: string; reviewAuthor: string; reviewBody: string; rating: number;
+    comment: Omit<ReviewComment, "replies">; parentName: string | null;
+  }[] = [];
+  for (const r of reviews) {
+    const walk = (list: ReviewComment[], parent: ReviewComment | null) =>
+      list.forEach((c) => {
+        const want = tab === "waiting" ? c.status === "pending" : tab === "hidden" ? c.status === "hidden" : c.type !== "store";
+        if (want) {
+          const { replies: _kids, ...comment } = c;
+          items.push({ reviewId: r.id, productId: r.productId, reviewAuthor: r.author, reviewBody: r.body, rating: r.rating, comment, parentName: parent?.name || null });
+        }
+        walk(c.replies || [], c);
+      });
+    walk(normalizeComments(JSON.parse(r.replies)), null);
+  }
+  items.sort((a, b) => Date.parse(b.comment.date) - Date.parse(a.comment.date));
+  const shown = items.slice(0, 100);
+
+  const productIds = [...new Set(shown.map((i) => i.productId))];
   const titles: Record<string, { title: string; image: string }> = {};
-  if (ids.length) {
+  if (productIds.length) {
     const d = await gql(admin, `query($ids: [ID!]!) { nodes(ids: $ids) { ... on Product { id title featuredMedia { preview { image { url } } } } } }`, {
-      ids: ids.map((id) => `gid://shopify/Product/${id}`),
+      ids: productIds.map((p) => `gid://shopify/Product/${p}`),
     });
-    d.nodes.filter(Boolean).forEach((n: any) => {
-      titles[n.id.split("/").pop()] = { title: n.title, image: n.featuredMedia?.preview?.image?.url || "" };
+    d.nodes.forEach((n: any) => {
+      if (n?.id) titles[n.id.split("/").pop()] = { title: n.title, image: n.featuredMedia?.preview?.image?.url || "" };
     });
   }
-  return {
-    view,
-    productId,
-    q,
-    shopName: shop.shop.name as string,
-    awaitingTotal,
-    products: withComments.map((w) => ({ id: w.productId, title: titles[w.productId]?.title || "Product", count: w._sum.commentCount || 0 })),
-    list: {
-      ...list,
-      items: list.items.map((i) => ({
-        ...i,
-        reviewNum: i.reviewId.split("/").pop(),
-        product: titles[i.productId] || { title: "Product", image: "" },
-      })),
-    },
-  };
+  return { tab, waitingCount, hiddenCount, items: shown, total: items.length, titles };
 };
 
-export const action = async ({ request }: ActionFunctionArgs) => {
-  const { admin, session } = await authenticate.admin(request);
-  const fd = await request.formData();
-  const reviewId = String(fd.get("reviewId") || "");
-  if (fd.get("intent") === "delete") {
-    await removeComment(admin, session.shop, reviewId, String(fd.get("commentId") || ""));
-    return { ok: true, message: "Removed" };
-  }
-  const text = String(fd.get("text") || "").trim();
-  if (!text) return { ok: false, message: "Write a reply first" };
-  await addComment(admin, session.shop, reviewId, { name: String(fd.get("author") || "Store"), text, type: "store" }, String(fd.get("parentId") || "") || null);
-  return { ok: true, message: "Reply posted" };
-};
+const CSS = `
+.cm { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; color: #303030; }
+.cm-item { display: grid; grid-template-columns: 36px 1fr auto; gap: 12px; padding: 14px 16px; border-top: 1px solid #f1f1f1; }
+.cm-item:first-child { border-top: 0; }
+.cm-av { width: 36px; height: 36px; border-radius: 50%; overflow: hidden; display: grid; place-items: center; background: #f1f1f1; color: #616161;
+  font-size: 12px; font-weight: 600; box-shadow: inset 0 0 0 1px rgba(0,0,0,.06); }
+.cm-av img { width: 100%; height: 100%; object-fit: cover; }
+.cm-meta { font-size: 12px; color: #8a8a8a; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.cm-name { font-size: 13px; font-weight: 600; color: #1f1f1f; }
+.cm-text { margin: 4px 0 6px; font-size: 13.5px; line-height: 20px; white-space: pre-wrap; word-break: break-word; }
+.cm-ctx { display: flex; gap: 8px; align-items: center; font-size: 12px; color: #8a8a8a; }
+.cm-ctx img { width: 22px; height: 22px; border-radius: 4px; object-fit: cover; }
+.cm-ctx a { color: #616161; }
+.cm-quote { max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cm-acts { display: flex; gap: 6px; align-items: flex-start; }
+.cm-btn { height: 30px; padding: 0 12px; border: 1px solid #dcdcdc; border-radius: 8px; background: #fff; color: #303030; font: inherit; font-size: 12.5px; cursor: pointer; }
+.cm-btn:hover { background: #fafafa; border-color: #b5b5b5; }
+.cm-btn.primary { background: #303030; border-color: #303030; color: #fff; }
+.cm-btn.danger { color: #b42318; }
+.cm-btn[disabled] { opacity: .5; cursor: default; }
+.cm-empty { padding: 40px 16px; text-align: center; color: #8a8a8a; font-size: 13px; }
+`;
 
-function when(iso: string) {
-  const d = Date.parse(iso);
-  const mins = Math.floor((Date.now() - d) / 60000);
-  if (mins < 60) return `${Math.max(1, mins)} min ago`;
-  if (mins < 1440) return `${Math.floor(mins / 60)} h ago`;
-  return new Date(d).toLocaleDateString("en-IN", { day: "numeric", month: "short" });
-}
-
-function CommentItem({ item, shopName }: { item: any; shopName: string }) {
-  const fetcher = useFetcher<typeof action>();
+function Item({ it, product }: { it: ReturnType<typeof useLoaderData<typeof loader>>["items"][number]; product?: { title: string; image: string } }) {
+  const fetcher = useFetcher<any>();
   const shopify = useAppBridge();
-  const [open, setOpen] = useState(item.awaiting);
   const busy = fetcher.state !== "idle";
+  const url = `/app/reviews/${it.productId}/${encodeURIComponent(it.reviewId.split("/").pop() || "")}`;
   useEffect(() => {
-    if (fetcher.data?.message) shopify.toast.show(fetcher.data.message, { isError: !fetcher.data.ok });
+    const d = fetcher.data;
+    if (d?.message) shopify.toast.show(d.message, { isError: d.ok === false });
   }, [fetcher.data, shopify]);
-  const n = item.node;
+  const send = (data: Record<string, string>) => fetcher.submit({ commentId: it.comment.id, ...data }, { method: "POST", action: url });
+  const c = it.comment;
 
   return (
-    <s-box padding="base" border="base" borderRadius="base" background={item.awaiting ? "subdued" : "base"}>
-      <s-stack gap="small-200">
-        <s-stack direction="inline" gap="small-200" alignItems="center">
-          <s-thumbnail src={item.product.image || undefined} alt={item.product.title} size="small-200" />
-          <s-link href={`/app/reviews/${item.productId}/${item.reviewNum}`}>{item.product.title}</s-link>
-          <s-text color="subdued">
-            · review by {item.reviewAuthor} <span style={{ color: "#f5a623" }}>{"★".repeat(item.rating)}</span>
-          </s-text>
-        </s-stack>
-        <s-text color="subdued">“{item.reviewBody.length > 110 ? item.reviewBody.slice(0, 110) + "…" : item.reviewBody}”</s-text>
-
-        <div style={{ borderLeft: "3px solid #e3e3e3", paddingLeft: 12, marginLeft: item.depth ? 12 : 0 }}>
-          <s-stack gap="small-300">
-            <s-stack direction="inline" gap="small-200" alignItems="center">
-              <s-text type="strong">{n.name}</s-text>
-              {n.type === "store" && <s-badge tone="info">Store</s-badge>}
-              {n.verified && <s-badge tone="success">Verified</s-badge>}
-              {item.parentName && <s-text color="subdued">replying to {item.parentName}</s-text>}
-              <s-text color="subdued">· {when(n.date)}</s-text>
-              {item.awaiting && <s-badge tone="critical">Needs reply</s-badge>}
-            </s-stack>
-            <s-text>{n.text}</s-text>
-          </s-stack>
+    <div className="cm-item">
+      <span className="cm-av">{c.avatar ? <img src={c.avatar} alt="" /> : initials(c.name)}</span>
+      <div style={{ minWidth: 0 }}>
+        <div className="cm-meta">
+          <span className="cm-name">{c.name}</span>
+          {c.verified && <span>· ✓ buyer</span>}
+          <span>· {new Date(c.date).toLocaleString("en-IN", { day: "numeric", month: "short", hour: "numeric", minute: "2-digit" })}</span>
+          {it.parentName && <span>· replying to {it.parentName}</span>}
+          {c.status === "pending" && <s-badge tone="critical">Waiting</s-badge>}
+          {c.status === "hidden" && <s-badge>Hidden</s-badge>}
         </div>
-
-        <s-stack direction="inline" gap="small-200">
-          <s-button variant={open ? "secondary" : "primary"} icon="chat" onClick={() => setOpen(!open)}>
-            {open ? "Close" : "Reply"}
-          </s-button>
-          <s-button
-            variant="tertiary"
-            tone="critical"
-            icon="delete"
-            onClick={() => {
-              if (confirm("Remove this comment and its replies?")) {
-                fetcher.submit({ intent: "delete", reviewId: item.reviewId, commentId: n.id }, { method: "POST" });
-              }
-            }}
-          >
-            Delete
-          </s-button>
-        </s-stack>
-
-        {open && (
-          <fetcher.Form
-            method="post"
-            onSubmit={(e) => {
-              const form = e.currentTarget;
-              setTimeout(() => form.reset(), 0);
-            }}
-          >
-            <input type="hidden" name="reviewId" value={item.reviewId} />
-            <input type="hidden" name="parentId" value={n.id} />
-            <input type="hidden" name="author" value={shopName} />
-            <s-stack gap="small-200">
-              <s-text-area label={`Reply to ${n.name} as ${shopName}`} name="text" rows={2} placeholder="Thanks! Happy you like it." />
-              <s-stack direction="inline" justifyContent="end">
-                <s-button type="submit" variant="primary" {...(busy ? { loading: true } : {})}>Post reply</s-button>
-              </s-stack>
-            </s-stack>
-          </fetcher.Form>
+        <div className="cm-text">{c.text}</div>
+        <div className="cm-ctx">
+          {product?.image && <img src={product.image} alt="" />}
+          <span>{product?.title || "Product"}</span>
+          <span>·</span>
+          <span className="cm-quote">on {it.reviewAuthor}'s review “{it.reviewBody}”</span>
+          <a href={url}>Open</a>
+        </div>
+      </div>
+      <div className="cm-acts">
+        {c.status !== "approved" && (
+          <button type="button" className="cm-btn primary" disabled={busy} onClick={() => send({ intent: "comment-status", status: "approved" })}>
+            {c.status === "pending" ? "Approve" : "Show"}
+          </button>
         )}
-      </s-stack>
-    </s-box>
+        {c.status !== "hidden" && (
+          <button type="button" className="cm-btn" disabled={busy} onClick={() => send({ intent: "comment-status", status: "hidden" })}>Hide</button>
+        )}
+        <button type="button" className="cm-btn danger" disabled={busy} onClick={() => { if (confirm("Delete this comment and its replies?")) send({ intent: "comment-delete" }); }}>
+          Delete
+        </button>
+      </div>
+    </div>
   );
 }
 
 export default function Comments() {
-  const { view, productId, q, shopName, awaitingTotal, products, list } = useLoaderData<typeof loader>();
+  const { tab, waitingCount, hiddenCount, items, total, titles } = useLoaderData<typeof loader>();
   const [params] = useSearchParams();
   const navigate = useNavigate();
-  const go = (next: Record<string, string | null>) => {
+  const go = (t: Tab) => {
     const p = new URLSearchParams(params);
-    Object.entries(next).forEach(([k, v]) => (v === null || v === "" ? p.delete(k) : p.set(k, v)));
-    if (!("page" in next)) p.delete("page");
+    if (t === "waiting") p.delete("tab"); else p.set("tab", t);
     navigate(`/app/comments?${p.toString()}`);
   };
 
   return (
     <s-page heading="Comments" inlineSize="large">
-      <s-link slot="breadcrumb-actions" href="/app/reviews">Reviews</s-link>
-
-      <s-section>
-        <s-stack gap="base">
+      <style>{CSS}</style>
+      <s-section padding="none">
+        <s-box padding="base">
           <s-stack direction="inline" gap="small-200">
-            <s-button variant={view === "needs-reply" ? "primary" : "secondary"} onClick={() => go({ view: null })}>
-              Needs reply ({awaitingTotal})
-            </s-button>
-            <s-button variant={view === "all" ? "primary" : "secondary"} onClick={() => go({ view: "all" })}>All comments</s-button>
+            <s-button variant={tab === "waiting" ? "primary" : "secondary"} onClick={() => go("waiting")}>Waiting for approval{tab === "waiting" ? ` (${total})` : waitingCount ? " •" : ""}</s-button>
+            <s-button variant={tab === "hidden" ? "primary" : "secondary"} onClick={() => go("hidden")}>Hidden{tab === "hidden" ? ` (${total})` : hiddenCount ? " •" : ""}</s-button>
+            <s-button variant={tab === "recent" ? "primary" : "secondary"} onClick={() => go("recent")}>Recent customer comments</s-button>
           </s-stack>
-          <s-grid gridTemplateColumns="1fr 1fr" gap="base" alignItems="end">
-            <s-select label="Product" value={productId} onChange={(e: any) => go({ product: e.currentTarget.value })}>
-              <s-option value="">All products</s-option>
-              {products.map((p) => (
-                <s-option key={p.id} value={p.id}>{p.title} ({p.count})</s-option>
-              ))}
-            </s-select>
-            <form
-              onSubmit={(e) => {
-                e.preventDefault();
-                go({ q: (new FormData(e.currentTarget).get("q") as string) || null });
-              }}
-            >
-              <s-search-field name="q" label="Search" placeholder="Name or text" defaultValue={q} />
-            </form>
-          </s-grid>
-        </s-stack>
-      </s-section>
-
-      <s-section>
-        <s-stack gap="base">
-          {list.items.map((item) => (
-            <CommentItem key={item.reviewId + item.node.id} item={item} shopName={shopName} />
-          ))}
-          {!list.items.length && (
-            <s-box padding="large">
-              <s-stack gap="small-200" alignItems="center">
-                <s-heading>{view === "needs-reply" ? "All caught up" : "No comments yet"}</s-heading>
-                <s-paragraph>
-                  {view === "needs-reply"
-                    ? "Every comment thread has your reply."
-                    : "Customer comments and replies on reviews will show up here."}
-                </s-paragraph>
-              </s-stack>
-            </s-box>
+        </s-box>
+        <s-divider />
+        <div className="cm">
+          {items.length === 0 ? (
+            <div className="cm-empty">
+              {tab === "waiting" ? "Nothing waiting. Comments with abusive words land here for your approval." : tab === "hidden" ? "No hidden comments." : "No customer comments yet."}
+            </div>
+          ) : (
+            items.map((it) => <Item key={it.reviewId + it.comment.id} it={it} product={titles[it.productId]} />)
           )}
-          {list.pages > 1 && (
-            <s-stack direction="inline" gap="base" justifyContent="center" alignItems="center">
-              <s-button disabled={list.page <= 1} onClick={() => go({ page: String(list.page - 1) })}>Previous</s-button>
-              <s-text>Page {list.page} of {list.pages}</s-text>
-              <s-button disabled={list.page >= list.pages} onClick={() => go({ page: String(list.page + 1) })}>Next</s-button>
-            </s-stack>
-          )}
-        </s-stack>
+        </div>
       </s-section>
+      <s-text color="subdued">
+        {total > items.length ? `Showing the latest ${items.length} of ${total}` : `${total} comment${total === 1 ? "" : "s"}`}
+        {tab === "waiting" ? " · Blocked words: Settings → Moderation" : ""}
+      </s-text>
     </s-page>
   );
 }
