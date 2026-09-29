@@ -71,6 +71,7 @@ function cleanSettings(list: any[], t: (v: unknown) => string): SettingDef[] {
     min: s.min, max: s.max, step: s.step, unit: s.unit ? t(s.unit) : "",
     placeholder: s.placeholder ? t(s.placeholder) : "",
     options: Array.isArray(s.options) ? s.options.map((o: any) => ({ value: String(o.value), label: t(o.label ?? o.value) })) : undefined,
+    visibleIf: typeof s.visible_if === "string" ? s.visible_if : undefined,
   }));
 }
 

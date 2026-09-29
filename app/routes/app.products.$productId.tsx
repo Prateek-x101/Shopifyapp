@@ -16,7 +16,7 @@ import { loadProductWidgets, saveWidget } from "../lib/product-widgets.server";
 import { previewUrl } from "../lib/preview.server";
 import { loadPageSections, saveSections, themeImageFromUpload } from "../lib/theme-sections.server";
 import type { SectionChange } from "../lib/theme-sections.server";
-import { WIDGET_OF_SECTION } from "../lib/theme-sections.shared";
+import { WIDGET_OF_SECTION, isVisible } from "../lib/theme-sections.shared";
 import type { SectionData, SettingDef } from "../lib/theme-sections.shared";
 import { AFTER_END, FIT_CHOICES, ICONS, ON_TAP, TIMER_MODES } from "../lib/product-widgets.shared";
 import type { Offer, OfferCard, VideoItem } from "../lib/product-widgets.shared";
@@ -578,6 +578,19 @@ function SettingField({ def, value, onChange, schemes, domain, pending, onImage 
   }
 }
 
+/** Settings to show right now: visible_if decides, and a heading with nothing visible under it is dropped. */
+function shownSettings(defs: SettingDef[], values: Record<string, unknown>, blockValues?: Record<string, unknown>) {
+  const withDefaults: Record<string, unknown> = {};
+  defs.forEach((d) => { if (d.id) withDefaults[d.id] = d.default; });
+  const cur = { ...withDefaults, ...values };
+  const vis = defs.filter((d) => blockValues ? isVisible(d.visibleIf, cur, cur) : isVisible(d.visibleIf, cur));
+  return vis.filter((d, i) => {
+    if (d.type !== "header") return true;
+    for (let j = i + 1; j < vis.length && vis[j].type !== "header"; j++) if (vis[j].type !== "paragraph") return true;
+    return false;
+  });
+}
+
 function SectionForm({ sec, draft, set, schemes, domain, templateFile, others, also, setAlso }: {
   sec: SectionData; draft: SecDraft; set: (d: SecDraft) => void; schemes: { value: string; label: string }[]; domain: string;
   templateFile: string; others: string[]; also: boolean; setAlso: (v: boolean) => void;
@@ -599,7 +612,7 @@ function SectionForm({ sec, draft, set, schemes, domain, templateFile, others, a
       <div className="te-sec">
         <s-stack gap="base">
           {sec.settings.length === 0 && <span className="te-note">This section has no settings.</span>}
-          {sec.settings.map((def, i) => (
+          {shownSettings(sec.settings, { ...sec.values, ...draft.settings }).map((def, i) => (
             <SettingField
               key={def.id || `${def.type}${i}`}
               def={def}
@@ -625,7 +638,7 @@ function SectionForm({ sec, draft, set, schemes, domain, templateFile, others, a
                 <div>
                   <s-stack gap="base">
                     {b.settings.length === 0 && <span className="te-note">No settings.</span>}
-                    {b.settings.map((def, i) => (
+                    {shownSettings(b.settings, { ...b.values, ...(draft.blocks[b.key] || {}) }, {}).map((def, i) => (
                       <SettingField
                         key={def.id || `${def.type}${i}`}
                         def={def}
