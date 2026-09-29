@@ -21,6 +21,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     try {
       await saveModeration(admin, session.shop, {
         buyers_only: fd.get("buyers_only") === "on",
+        auto_publish: fd.get("auto_publish") === "on",
         extra_words: String(fd.get("extra_words") || "").split(/[\n,]+/),
       });
       return { ok: true, message: "Moderation saved" };
@@ -95,13 +96,19 @@ export default function Settings() {
               details="The shopper must be logged in (Shopify or Google) with the account that placed an order of that product."
               defaultChecked={data.mod.buyers_only}
             />
+            <s-checkbox
+              name="auto_publish"
+              label="Publish clean reviews right away"
+              details="Reviews without abusive words go live at once. Reviews, comments and replies with abusive words always wait in Pending. Turn off to check every review yourself."
+              defaultChecked={data.mod.auto_publish}
+            />
             <s-text-area
               label="Extra blocked words"
               name="extra_words"
               rows={3}
               defaultValue={data.mod.extra_words.join(", ")}
               placeholder="word1, word2, word3"
-              details="Comments and replies with abusive words (a built-in English + Hindi/Hinglish list, plus these) wait in Pending until you approve them."
+              details="Reviews, comments and replies with abusive words (a built-in English + Hindi/Hinglish list, plus these) wait in Pending until you approve them."
             />
             <s-stack direction="inline" justifyContent="end">
               <s-button type="submit" variant="primary" {...(modFetcher.state !== "idle" ? { loading: true } : {})}>Save</s-button>

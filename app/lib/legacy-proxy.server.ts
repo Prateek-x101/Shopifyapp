@@ -161,11 +161,19 @@ export async function legacyPost(admin: Admin, shop: string, sp: URLSearchParams
     let images: Awaited<ReturnType<typeof uploadImages>> = [];
     try { images = await uploadImages(admin, files); } catch { images = []; }
 
+    const location = String(body.location || "").trim().slice(0, 60) || null;
+    // abusive words (name, text or city) → waits for the admin; clean reviews from buyers go live (setting)
+    const flagged = isAbusive(`${name} ${text} ${location || ""}`, mod.extra_words);
+    const status = flagged || !mod.auto_publish ? "pending" : "published";
     await createReview(admin, shop, {
-      productId, rating, body: text, author: name, status: "pending", verified, orderId, images, source: "Website",
-      location: String(body.location || "").trim().slice(0, 60) || null,
+      productId, rating, body: text, author: name, status, verified, orderId, images, source: "Website", location,
     });
-    return json({ success: true, status: "pending", persisted: true, message: "Thank you! Your review will appear after a quick check." });
+    return json({
+      success: true,
+      status: status === "published" ? "approved" : "pending",
+      persisted: true,
+      message: status === "published" ? "Thank you! Your review has been posted." : "Thank you! Your review will appear after a quick check.",
+    });
   }
 
   /* ── comment on a review / reply to a comment ── */

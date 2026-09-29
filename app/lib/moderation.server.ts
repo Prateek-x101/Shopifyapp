@@ -1,11 +1,12 @@
 /**
  * Moderation for what shoppers write in the review widget.
  *
- *   - Abusive words (English, Hindi/Hinglish, Devanagari) → the comment/reply waits as "pending" for the admin.
+ *   - Abusive words (English, Hindi/Hinglish, Devanagari) → the review / comment / reply waits as "pending" for the admin.
+ *   - "Publish clean reviews right away" → reviews without abusive words go live at once (otherwise all wait).
  *   - "Only buyers can review" → a review needs a logged-in customer with an order of that product.
  *
  * Settings live on the shop in a private metafield `vw_reviews.moderation` (JSON, no storefront access, because the
- * extra blocked words should not be readable by shoppers):  { buyers_only: boolean, extra_words: string[] }
+ * extra blocked words should not be readable by shoppers):  { buyers_only: boolean, auto_publish: boolean, extra_words: string[] }
  */
 import { gql } from "./reviews.server";
 
@@ -14,8 +15,8 @@ type Admin = { graphql: (q: string, o?: { variables?: Record<string, unknown> })
 const NS = "vw_reviews";
 const KEY = "moderation";
 
-export type Moderation = { buyers_only: boolean; extra_words: string[] };
-const DEFAULTS: Moderation = { buyers_only: true, extra_words: [] };
+export type Moderation = { buyers_only: boolean; auto_publish: boolean; extra_words: string[] };
+const DEFAULTS: Moderation = { buyers_only: true, auto_publish: true, extra_words: [] };
 
 /* ───────────────────────── word lists ───────────────────────── */
 // Matched as whole words (after normalising), so "class" or "assistant" never trip "ass".
@@ -81,6 +82,7 @@ export async function getModeration(admin: Admin, shop = ""): Promise<Moderation
     const raw = JSON.parse(d.shop.metafield?.value || "{}");
     v = {
       buyers_only: raw.buyers_only === undefined ? DEFAULTS.buyers_only : !!raw.buyers_only,
+      auto_publish: raw.auto_publish === undefined ? DEFAULTS.auto_publish : !!raw.auto_publish,
       extra_words: Array.isArray(raw.extra_words) ? raw.extra_words.map(String).slice(0, 500) : [],
     };
   } catch { /* defaults */ }
@@ -92,6 +94,7 @@ export async function saveModeration(admin: Admin, shop: string, next: Moderatio
   const d = await gql(admin, `{ shop { id } }`);
   const value: Moderation = {
     buyers_only: !!next.buyers_only,
+    auto_publish: !!next.auto_publish,
     extra_words: [...new Set(next.extra_words.map((w) => w.trim().toLowerCase()).filter(Boolean))].slice(0, 500),
   };
   const r = await gql(admin, `mutation($m: [MetafieldsSetInput!]!) { metafieldsSet(metafields: $m) { userErrors { field message } } }`, {

@@ -19,6 +19,7 @@ import { countComments, normalizeComments } from "../lib/reviews.shared";
 import type { BulkItem, ReviewComment } from "../lib/reviews.shared";
 import { ReviewHeader, Thread, initials, peopleOf } from "../components/review-thread";
 import { BulkUpload } from "../components/bulk-upload";
+import { getModeration, isAbusive } from "../lib/moderation.server";
 
 /** Filters come from the URL, so the loader and "select all matching" use exactly the same set. */
 function filtersFrom(sp: URLSearchParams, shop: string, productId: string): ReviewFilters {
@@ -45,7 +46,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const sp = new URL(request.url).searchParams;
   const base = { shop: session.shop, productId };
 
-  const [prod, list, counts, customerCount, flaggedCount] = await Promise.all([
+  const [prod, list, counts, customerCount, flaggedCount, mod] = await Promise.all([
     gql(admin, `query($id: ID!) { product(id: $id) { id title handle onlineStoreUrl featuredMedia { preview { image { url } } } } shop { name } }`, {
       id: `gid://shopify/Product/${productId}`,
     }),
@@ -53,6 +54,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     prisma.review.groupBy({ by: ["status"], where: base, _count: true }),
     prisma.review.count({ where: { ...base, source: "Website" } }),
     prisma.review.count({ where: { ...base, replies: { contains: '"status":"pending"' } } }),
+    getModeration(admin, session.shop),
   ]);
   if (!prod.product) throw new Response("Product not found", { status: 404 });
   const byStatus: Record<string, number> = { published: 0, pending: 0, hidden: 0 };
@@ -93,6 +95,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
           thread,
           replies: countComments(thread),
           pendingComments: countPending(thread),
+          abusive: isAbusive(`${r.author} ${r.title || ""} ${r.body} ${r.location || ""}`, mod.extra_words),
           needsReply: r.needsReply,
           createdAt: r.createdAt.toISOString(),
         };
@@ -421,6 +424,9 @@ function ReviewView({
           </div>
         </div>
       </div>
+      {r.abusive && (
+        <div className="rv-flag" style={{ margin: "0 0 6px" }}>⚑ Contains abusive words — it stays off the store until you publish it</div>
+      )}
       {r.title && <div className="rp-title">{r.title}</div>}
       <div className="rp-text">{r.body}</div>
       <div className="rp-facts">
@@ -693,6 +699,7 @@ export default function ProductReviews() {
                     <s-stack direction="inline" gap="small-200" alignItems="center">
                       <Stars n={r.rating} />
                       {r.featured && <s-badge tone="info" icon="pin">Pinned</s-badge>}
+                      {r.abusive && <s-badge tone="critical">⚑ Abusive words</s-badge>}
                     </s-stack>
                     {r.title && <s-text type="strong">{r.title}</s-text>}
                     <p className="rv-body">{r.body}</p>
