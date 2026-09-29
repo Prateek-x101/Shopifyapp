@@ -10,7 +10,7 @@
  */
 import prisma from "../db.server";
 import { customerFromToken, googleLogin } from "./google-login.server";
-import { getModeration, isAbusive } from "./moderation.server";
+import { addStrike, blockUser, getModeration, isAbusive, isBlocked, spamReason } from "./moderation.server";
 import {
   addComment,
   createReview,
@@ -70,6 +70,40 @@ export async function legacyGet(shop: string, sp: URLSearchParams, admin: Admin 
     return json({ success: true, approvedCount, pendingCount, totalCount: approvedCount }, { headers: { "Cache-Control": "public, max-age=30" } });
   }
 
+  if (action === "my_profile") {
+    // the shopper's own profile for the widget: name, email, recent orders, how much they have written
+    const customerId = num(sp.get("logged_in_customer_id")) || customerFromToken(sp.get("vw_t"), shop);
+    const noStore = { headers: { "Cache-Control": "private, no-store" } };
+    if (!customerId || !admin) return json({ success: false, error: "Please log in." }, { status: 401, ...noStore });
+    const d = await gql(admin, `query($id: ID!) { customer(id: $id) { displayName firstName email numberOfOrders
+      orders(first: 10, reverse: true) { nodes { name createdAt displayFulfillmentStatus displayFinancialStatus
+        currentTotalPriceSet { shopMoney { amount currencyCode } }
+        lineItems(first: 4) { nodes { title quantity image { url } product { handle } } } } } } }`, {
+      id: `gid://shopify/Customer/${customerId}`,
+    });
+    const c = d.customer;
+    if (!c) return json({ success: false, error: "Account not found" }, { status: 404, ...noStore });
+    const threads = await prisma.review.count({ where: { shop, replies: { contains: `"customerId":"${customerId}"` } } });
+    return json({
+      success: true,
+      name: c.firstName || c.displayName || "",
+      email: c.email || "",
+      ordersCount: Number(c.numberOfOrders || 0),
+      threads,
+      orders: (c.orders?.nodes || []).map((o: any) => ({
+        name: o.name,
+        date: o.createdAt,
+        status: o.displayFulfillmentStatus,
+        payment: o.displayFinancialStatus,
+        total: o.currentTotalPriceSet?.shopMoney?.amount,
+        currency: o.currentTotalPriceSet?.shopMoney?.currencyCode,
+        items: (o.lineItems?.nodes || []).map((li: any) => ({
+          title: li.title, qty: li.quantity, image: li.image?.url || "", handle: li.product?.handle || "",
+        })),
+      })),
+    }, noStore);
+  }
+
   if (action === "sales_popup_feed") {
     // The old "recent purchases" feed is not part of this app: tell the popup to stay quiet.
     return json({ success: true, events: [], pollAfterSeconds: 900 }, { headers: { "Cache-Control": "public, max-age=300" } });
@@ -126,6 +160,7 @@ export async function legacyPost(admin: Admin, shop: string, sp: URLSearchParams
       return json({ success: false, error: "Please add a star rating and a few words." }, { status: 400 });
     }
     const mod = await getModeration(admin, shop);
+    if (isBlocked(mod, customerId)) return json({ success: false, error: "You can't post reviews on this store." }, { status: 403 });
     // only people who ordered this product may review it (setting "Only buyers can review", on by default)
     if ((mod.buyers_only || body.requireLoginToReview) && !customerId) {
       return json({
@@ -164,7 +199,12 @@ export async function legacyPost(admin: Admin, shop: string, sp: URLSearchParams
 
     const location = String(body.location || "").trim().slice(0, 60) || null;
     // abusive words (name, text or city) → waits for the admin; clean reviews from buyers go live (setting)
-    const flagged = isAbusive(`${name} ${text} ${location || ""}`, mod.extra_words);
+    const spam = mod.spam_filter && customerId ? spamReason(customerId, text) : "";
+    if (spam && customerId && addStrike(customerId, mod.auto_block)) {
+      await blockUser(admin, shop, { id: customerId, name, reason: `Automatic: spam (${spam})` });
+      return json({ success: false, error: "You can't post reviews on this store." }, { status: 403 });
+    }
+    const flagged = !!spam || isAbusive(`${name} ${text} ${location || ""}`, mod.extra_words);
     const status = flagged || !mod.auto_publish ? "pending" : "published";
     await createReview(admin, shop, {
       productId, rating, body: text, author: name, status, verified, orderId, images, source: "Website", location,
@@ -190,9 +230,15 @@ export async function legacyPost(admin: Admin, shop: string, sp: URLSearchParams
       verified = info.orders.length > 0;
       if (!name && info.name) name = info.name;
     } catch { /* not verified */ }
-    // abusive words → the comment waits for the admin (Engine → Comments) instead of going live
+    // blocked shoppers can't post; spam and abusive words wait for the admin (Engine → Comments)
     const mod = await getModeration(admin, shop);
-    const flagged = isAbusive(`${name} ${text}`, mod.extra_words);
+    if (isBlocked(mod, customerId)) return json({ success: false, error: "You can't comment on this store." }, { status: 403 });
+    const spam = mod.spam_filter ? spamReason(customerId, text) : "";
+    if (spam && addStrike(customerId, mod.auto_block)) {
+      await blockUser(admin, shop, { id: customerId, name: name || "Customer", reason: `Automatic: spam (${spam})` });
+      return json({ success: false, error: "You can't comment on this store." }, { status: 403 });
+    }
+    const flagged = !!spam || isAbusive(`${name} ${text}`, mod.extra_words);
     const rid = reviewGid(body.reviewId);
     let parentId = actionType === "submit_reply" ? String(body.commentId || "") : null;
     // replying to a comment you posted a moment ago: the widget still knows it by its temporary id "cmt_<time>"

@@ -349,6 +349,17 @@ function Node({ node, depth, onReply, activeId }: { node: ReviewComment; depth: 
               <button type="button" className="cv-act danger" disabled={busy} onClick={() => { if (confirm("Delete this and its replies?")) send({ intent: "comment-delete" }); }}>
                 Delete
               </button>
+              {!store && node.customerId && (
+                <button
+                  type="button"
+                  className="cv-act danger"
+                  disabled={busy}
+                  title="They won't be able to post reviews, comments or replies"
+                  onClick={() => { if (confirm(`Block ${node.name}? They won't be able to post reviews, comments or replies. This comment will be hidden.`)) send({ intent: "block-user", hide: "true" }); }}
+                >
+                  Block
+                </button>
+              )}
             </div>
           )}
         </div>

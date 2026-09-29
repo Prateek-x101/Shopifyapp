@@ -392,7 +392,7 @@ export const LEGACY_KEY = "summary_v2"; // v1 holds the old generated data and i
 const LEGACY_PREVIEW = 10;
 
 /** A review in the shape the storefront widget renders (name, text, comments[], helpfulCount…). */
-export function legacyReview(r: any, helpfulByCustomerIds: string[] = [], likedBy: Record<string, string[]> = {}) {
+export function legacyReview(r: any, helpfulByCustomerIds: string[] = [], likedBy: Record<string, string[]> = {}, viewer = "") {
   const images: ReviewImage[] = typeof r.images === "string" ? JSON.parse(r.images) : r.images || [];
   const comments = normalizeComments(typeof r.replies === "string" ? JSON.parse(r.replies) : r.replies || []);
   const visible = (c: ReviewComment) => c.status === "approved";
@@ -407,6 +407,7 @@ export function legacyReview(r: any, helpfulByCustomerIds: string[] = [], likedB
     verified: !!c.verified,
     likeCount: c.likeCount,
     likedByCustomerIds: likedBy[c.id] || [],
+    mine: !!viewer && c.customerId === viewer, // the shopper looking at the page wrote it (no Reply on own comments)
     parentCommentId: c.parentCommentId || null,
     replies: (c.replies || []).filter(visible).map(mapC),
   });
@@ -448,7 +449,7 @@ export async function legacyPage(shop: string, productId: string, page: number, 
   mine.l.forEach((id) => (liked[id] = [customerId]));
   return {
     success: true,
-    reviews: rows.map((r) => legacyReview(r, mine.h.includes(r.id) ? [customerId] : [], liked)),
+    reviews: rows.map((r) => legacyReview(r, mine.h.includes(r.id) ? [customerId] : [], liked, customerId)),
     count: rows.length,
     totalCount: total,
     pageCount: Math.max(1, Math.ceil(total / 10)),

@@ -5,7 +5,7 @@ import { useAppBridge } from "@shopify/app-bridge-react";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import { ensureSettingsDefinition, getSettings, saveSettings } from "../lib/settings.server";
-import { getModeration, saveModeration } from "../lib/moderation.server";
+import { getModeration, saveModeration, unblockUser } from "../lib/moderation.server";
 import { repairWidget, widgetStatus } from "../lib/theme-repair.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
@@ -32,11 +32,21 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       return { ok: false, message: e?.message || "Could not update the theme" };
     }
   }
+  if (fd.get("intent") === "unblock") {
+    try {
+      await unblockUser(admin, session.shop, String(fd.get("id") || ""));
+      return { ok: true, message: "Unblocked" };
+    } catch (e: any) {
+      return { ok: false, message: e?.message || "Could not unblock" };
+    }
+  }
   if (fd.get("intent") === "moderation") {
     try {
       await saveModeration(admin, session.shop, {
         buyers_only: fd.get("buyers_only") === "on",
         auto_publish: fd.get("auto_publish") === "on",
+        spam_filter: fd.get("spam_filter") === "on",
+        auto_block: parseInt(String(fd.get("auto_block") || "0"), 10) || 0,
         extra_words: String(fd.get("extra_words") || "").split(/[\n,]+/),
       });
       return { ok: true, message: "Moderation saved" };
@@ -56,6 +66,31 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return { ok: false, message: e?.message || "Could not save" };
   }
 };
+
+function UnblockRow({ b }: { b: { id: string; name: string; at: string; reason: string } }) {
+  const fetcher = useFetcher<typeof action>();
+  const shopify = useAppBridge();
+  useEffect(() => {
+    if (fetcher.data?.message) shopify.toast.show(fetcher.data.message, { isError: !fetcher.data.ok });
+  }, [fetcher.data, shopify]);
+  return (
+    <s-box padding="small-200" border="base" borderRadius="base">
+      <s-stack direction="inline" gap="base" alignItems="center" justifyContent="space-between">
+        <s-stack gap="none">
+          <s-text type="strong">{b.name || "Customer"}</s-text>
+          <s-text color="subdued">
+            {b.reason} · {new Date(b.at).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" })} · customer #{b.id}
+          </s-text>
+        </s-stack>
+        <fetcher.Form method="post">
+          <input type="hidden" name="intent" value="unblock" />
+          <input type="hidden" name="id" value={b.id} />
+          <s-button type="submit" {...(fetcher.state !== "idle" ? { loading: true } : {})}>Unblock</s-button>
+        </fetcher.Form>
+      </s-stack>
+    </s-box>
+  );
+}
 
 export default function Settings() {
   const data = useLoaderData<typeof loader>();
@@ -151,6 +186,21 @@ export default function Settings() {
               details="Reviews without abusive words go live at once. Reviews, comments and replies with abusive words always wait in Pending. Turn off to check every review yourself."
               defaultChecked={data.mod.auto_publish}
             />
+            <s-checkbox
+              name="spam_filter"
+              label="Spam filter"
+              details="Links, phone numbers, promotions (earn money, WhatsApp me, crypto…), ALL CAPS, emoji floods, the same message again, or many messages at once → the message waits in Pending and counts as a strike."
+              defaultChecked={data.mod.spam_filter}
+            />
+            <s-number-field
+              label="Block automatically after this many spam strikes in 24 hours"
+              name="auto_block"
+              min={0}
+              max={20}
+              step={1}
+              defaultValue={String(data.mod.auto_block)}
+              details="0 = never block automatically. Blocked shoppers can't post reviews, comments or replies."
+            />
             <s-text-area
               label="Extra blocked words"
               name="extra_words"
@@ -165,6 +215,18 @@ export default function Settings() {
           </s-stack>
         </s-section>
       </modFetcher.Form>
+
+      <s-section heading={`Blocked shoppers (${data.mod.blocked.length})`}>
+        {data.mod.blocked.length === 0 ? (
+          <s-paragraph>Nobody is blocked. Use “Block” on a comment (Comments page or a review’s conversation), or let the spam filter do it.</s-paragraph>
+        ) : (
+          <s-stack gap="small-200">
+            {data.mod.blocked.map((b) => (
+              <UnblockRow key={b.id} b={b} />
+            ))}
+          </s-stack>
+        )}
+      </s-section>
 
       <s-section slot="aside" heading="Get a Google Client ID">
         <s-ordered-list>

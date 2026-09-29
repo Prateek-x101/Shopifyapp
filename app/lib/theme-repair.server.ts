@@ -1,87 +1,169 @@
 /**
  * Small, targeted repairs to the review widget in the live theme (Online Store → published theme).
  *
- * Reads the current file from the theme, applies only the listed patches that are still missing, and writes it back,
- * so whatever else is in the file stays exactly as it is. Safe to run again (each patch checks itself first).
+ * Reads the current files from the theme, applies only the patches that are still missing, and writes them back,
+ * so whatever else is in a file stays exactly as it is. Safe to run again (each patch checks itself first).
+ * engine-google-login.js belongs to this app, so it is replaced as a whole by the version in app/theme-assets.
  */
 import { gql } from "./reviews.server";
+import GOOGLE_LOGIN_JS from "../theme-assets/engine-google-login.js?raw";
 
 type Admin = { graphql: (q: string, o?: { variables?: Record<string, unknown> }) => Promise<Response> };
 
-const FILE = "assets/review-widget.js";
+type Patch = { label: string; applied: (s: string) => boolean; apply: (s: string) => string | null };
 
-type Patch = { id: string; label: string; applied: (s: string) => boolean; apply: (s: string) => string | null };
+/** Insert `add` right before the first match of `re` (null when there is no match). */
+function before(s: string, re: RegExp, add: string) {
+  const m = s.match(re);
+  if (!m || m.index === undefined) return null;
+  return s.slice(0, m.index) + add + s.slice(m.index);
+}
+/** Replace the first match of `re` (null when there is no match). */
+function swap(s: string, re: RegExp, to: (m: RegExpMatchArray) => string) {
+  const m = s.match(re);
+  if (!m || m.index === undefined) return null;
+  return s.slice(0, m.index) + to(m) + s.slice(m.index + m[0].length);
+}
 
-const PATCHES: Patch[] = [
+const WIDGET_JS: Patch[] = [
   {
-    // submitComment() calls getCommenterName(), which is missing → ReferenceError, the reply is never sent and the
-    // widget stays "submitting" (every later reply is ignored too).
-    id: "commenter-name",
+    // submitComment() calls getCommenterName(), which was missing → ReferenceError, the reply is never sent
     label: "Replies: missing getCommenterName()",
     applied: (s) => /function\s+getCommenterName\s*\(/.test(s),
-    apply: (s) => {
-      const fn =
+    apply: (s) =>
+      before(s, /let\s+isSubmitting\s*=\s*(?:false|!1)\s*;/,
         "function getCommenterName() {\n" +
         "        try { if (typeof getCustomerDisplayName === 'function') { const n = getCustomerDisplayName(); if (n) return n; } } catch (e) {}\n" +
         "        const c = window.__arwCustomer || null;\n" +
         "        return (c && (c.name || [c.firstName, c.lastName].filter(Boolean).join(' '))) || 'Customer';\n" +
-        "    }\n    ";
-      const m = s.match(/let\s+isSubmitting\s*=\s*(?:false|!1)\s*;/);
-      if (!m || m.index === undefined) return null;
-      return s.slice(0, m.index) + fn + s.slice(m.index);
-    },
+        "    }\n    "),
   },
   {
     // if anything throws while drawing the new reply, release the lock so the next send still works
-    id: "submit-unlock",
     label: "Replies: never stay stuck after an error",
     applied: (s) => s.includes("__arwSubmitGuard"),
-    apply: (s) => {
-      const m = s.match(/async\s+function\s+submitComment\s*\(\s*\)\s*\{/);
-      if (!m || m.index === undefined) return null;
-      // submitComment is async, so a crash inside it surfaces as an unhandled rejection
-      const guard =
+    apply: (s) =>
+      before(s, /async\s+function\s+submitComment\s*\(\s*\)\s*\{/,
         "(function __arwSubmitGuard() { const unlock = function () { try { isSubmitting = false; } catch (e) {} };\n" +
-        "        window.addEventListener('unhandledrejection', unlock); window.addEventListener('error', unlock); })();\n    ";
-      return s.slice(0, m.index) + guard + s.slice(m.index);
+        "        window.addEventListener('unhandledrejection', unlock); window.addEventListener('error', unlock); })();\n    "),
+  },
+  {
+    // Google sign-in switches the customer without reloading the page
+    label: "Login: no page reload after signing in",
+    applied: (s) => s.includes("__arwSetCustomer"),
+    apply: (s) =>
+      swap(s, /const\s+CUSTOMER\s*=\s*window\.__arwCustomer\s*\|\|\s*null\s*;/, () =>
+        "let CUSTOMER = window.__arwCustomer || null;\n    window.__arwSetCustomer = function (c) { CUSTOMER = c || null; };"),
+  },
+  {
+    // the sheet kept its open height while sliding away, then snapped smaller → it looked like it jumped
+    label: "Comments sheet: smooth close",
+    applied: (s) => s.includes("__arwSheetH"),
+    apply: (s) =>
+      swap(s, /(function\s+closeReplies\s*\([^)]*\)\s*\{[\s\S]*?sheet\.classList\.remove\(\s*'active'\s*\)\s*;\s*)sheet\.style\.height\s*=\s*''\s*;/, (m) =>
+        m[1] + "const __arwSheetH = sheet; setTimeout(function () { if (!__arwSheetH.classList.contains('active')) __arwSheetH.style.height = ''; }, 420);"),
+  },
+  {
+    // nobody replies to their own comment: hide "Reply" on it
+    label: "Comments: no Reply on your own comment",
+    applied: (s) => s.includes("__arwIsMine"),
+    apply: (s) => {
+      const withHelper = before(s, /function\s+ytItem\s*\(/,
+        "function __arwIsMine(item) {\n" +
+        "        if (!item || !CUSTOMER || !CUSTOMER.id) return false;\n" +
+        "        return item.mine === true || (item.customerId != null && String(item.customerId) === String(CUSTOMER.id));\n" +
+        "    }\n    ");
+      if (!withHelper) return null;
+      return swap(withHelper, /html\s*\+=\s*`<button type="button" class="yt-reply" onclick="ARWidget\._replyTo\('\$\{escapeHtml\(id\)\}'/, (m) =>
+        "if (!__arwIsMine(item)) " + m[0]);
     },
+  },
+  {
+    // a comment you just posted is yours at once (before the page is reloaded)
+    label: "Comments: your new comment is marked as yours",
+    applied: (s) => /id:\s*'cmt_'\s*\+\s*Date\.now\(\),\s*mine:\s*true/.test(s),
+    apply: (s) => swap(s, /id:\s*'cmt_'\s*\+\s*Date\.now\(\),/, (m) => m[0] + " mine: true,"),
   },
 ];
 
+const WIDGET_CSS: Patch[] = [
+  {
+    // the page scrollbar disappeared while the sheet was open → the whole page shifted sideways and back
+    label: "Comments sheet: page doesn't shift when it opens/closes",
+    applied: (s) => s.includes("engine: steady page"),
+    apply: (s) =>
+      s.replace(/\s*$/, "") +
+      "\n\n/* engine: steady page while the comments sheet is open (no scrollbar jump, same height open and closing) */\n" +
+      "html { scrollbar-gutter: stable; }\n" +
+      ".ai-reply-sheet { height: 70vh; }\n",
+  },
+];
+
+const GOOGLE_LOGIN: Patch[] = [
+  {
+    label: "Login: stays on the same review, profile with orders",
+    applied: (s) => s.includes("VWLOGIN_V2") && s.length >= GOOGLE_LOGIN_JS.length - 50 && s.includes("version: 2"),
+    apply: () => GOOGLE_LOGIN_JS,
+  },
+];
+
+const FILES: Record<string, Patch[]> = {
+  "assets/review-widget.js": WIDGET_JS,
+  "assets/review-widget.css": WIDGET_CSS,
+  "assets/engine-google-login.js": GOOGLE_LOGIN,
+};
+
 async function mainTheme(admin: Admin) {
+  const names = JSON.stringify(Object.keys(FILES));
   const d = await gql(admin, `{ themes(first: 1, roles: [MAIN]) { nodes { id name
-    files(filenames: ["${FILE}"]) { nodes { filename body { ... on OnlineStoreThemeFileBodyText { content } } } } } } }`);
+    files(filenames: ${names}, first: 10) { nodes { filename body { ... on OnlineStoreThemeFileBodyText { content } } } } } } }`);
   const t = d.themes.nodes[0];
   if (!t) throw new Error("No published theme found");
-  const content: string | undefined = t.files?.nodes?.[0]?.body?.content;
-  return { id: t.id as string, name: t.name as string, content };
+  const files: Record<string, string> = {};
+  (t.files?.nodes || []).forEach((f: any) => { if (typeof f.body?.content === "string") files[f.filename] = f.body.content; });
+  return { id: t.id as string, name: t.name as string, files };
 }
 
 /** What the live widget still needs. */
 export async function widgetStatus(admin: Admin) {
   const t = await mainTheme(admin);
-  if (!t.content) return { theme: t.name, found: false, missing: [] as string[] };
-  return { theme: t.name, found: true, missing: PATCHES.filter((p) => !p.applied(t.content!)).map((p) => p.label) };
+  const found = !!t.files["assets/review-widget.js"];
+  const missing: string[] = [];
+  for (const [file, patches] of Object.entries(FILES)) {
+    const s = t.files[file];
+    if (s === undefined) continue;
+    patches.forEach((p) => { if (!p.applied(s)) missing.push(p.label); });
+  }
+  return { theme: t.name, found, missing };
 }
 
 export async function repairWidget(admin: Admin) {
   const t = await mainTheme(admin);
-  if (!t.content) throw new Error(`${FILE} was not found in the theme "${t.name}"`);
-  let s = t.content;
+  if (!t.files["assets/review-widget.js"]) throw new Error(`assets/review-widget.js was not found in the theme "${t.name}"`);
   const done: string[] = [];
   const failed: string[] = [];
-  for (const p of PATCHES) {
-    if (p.applied(s)) continue;
-    const next = p.apply(s);
-    if (next && p.applied(next)) { s = next; done.push(p.label); } else failed.push(p.label);
+  const changed: { filename: string; body: { type: "TEXT"; value: string } }[] = [];
+  for (const [file, patches] of Object.entries(FILES)) {
+    let s = t.files[file];
+    if (s === undefined) continue;
+    const start = s;
+    for (const p of patches) {
+      if (p.applied(s)) continue;
+      const next = p.apply(s);
+      if (next && p.applied(next)) { s = next; done.push(p.label); } else failed.push(p.label);
+    }
+    if (s !== start) changed.push({ filename: file, body: { type: "TEXT", value: s } });
   }
-  if (!done.length) return { theme: t.name, done, failed };
+  if (!changed.length) return { theme: t.name, done, failed };
   const r = await gql(admin, `mutation($id: ID!, $files: [OnlineStoreThemeFilesUpsertFileInput!]!) {
     themeFilesUpsert(themeId: $id, files: $files) { upsertedThemeFiles { filename } userErrors { field message } } }`, {
     id: t.id,
-    files: [{ filename: FILE, body: { type: "TEXT", value: s } }],
+    files: changed,
   });
   const errs = r.themeFilesUpsert.userErrors;
   if (errs?.length) throw new Error(errs.map((e: any) => e.message).join(", "));
   return { theme: t.name, done, failed };
 }
+
+/** For tests: the patch lists. */
+export const __patches = FILES;

@@ -6,7 +6,11 @@
  *   - "Only buyers can review" → a review needs a logged-in customer with an order of that product.
  *
  * Settings live on the shop in a private metafield `vw_reviews.moderation` (JSON, no storefront access, because the
- * extra blocked words should not be readable by shoppers):  { buyers_only: boolean, auto_publish: boolean, extra_words: string[] }
+ * extra blocked words should not be readable by shoppers):
+ *   { buyers_only, auto_publish, extra_words: string[], spam_filter, auto_block: number, blocked: [{ id, name, at, reason }] }
+ *
+ *   - Spam (links, phone numbers, promotions, the same text again and again, bursts) → waits as "pending" and counts
+ *     as a strike; after `auto_block` strikes in 24 hours the shopper is blocked. Blocked shoppers can't post at all.
  */
 import { gql } from "./reviews.server";
 
@@ -15,8 +19,16 @@ type Admin = { graphql: (q: string, o?: { variables?: Record<string, unknown> })
 const NS = "vw_reviews";
 const KEY = "moderation";
 
-export type Moderation = { buyers_only: boolean; auto_publish: boolean; extra_words: string[] };
-const DEFAULTS: Moderation = { buyers_only: true, auto_publish: true, extra_words: [] };
+export type BlockedUser = { id: string; name: string; at: string; reason: string };
+export type Moderation = {
+  buyers_only: boolean;
+  auto_publish: boolean;
+  extra_words: string[];
+  spam_filter: boolean;
+  auto_block: number; // strikes in 24 h before an automatic block (0 = never)
+  blocked: BlockedUser[];
+};
+const DEFAULTS: Moderation = { buyers_only: true, auto_publish: true, extra_words: [], spam_filter: true, auto_block: 3, blocked: [] };
 
 /* ───────────────────────── word lists ───────────────────────── */
 // Matched as whole words (after normalising), so "class" or "assistant" never trip "ass".
@@ -84,18 +96,27 @@ export async function getModeration(admin: Admin, shop = ""): Promise<Moderation
       buyers_only: raw.buyers_only === undefined ? DEFAULTS.buyers_only : !!raw.buyers_only,
       auto_publish: raw.auto_publish === undefined ? DEFAULTS.auto_publish : !!raw.auto_publish,
       extra_words: Array.isArray(raw.extra_words) ? raw.extra_words.map(String).slice(0, 500) : [],
+      spam_filter: raw.spam_filter === undefined ? DEFAULTS.spam_filter : !!raw.spam_filter,
+      auto_block: Number.isFinite(raw.auto_block) ? Math.max(0, Math.min(20, raw.auto_block)) : DEFAULTS.auto_block,
+      blocked: Array.isArray(raw.blocked) ? raw.blocked.filter((b: any) => b && b.id).slice(0, 2000) : [],
     };
   } catch { /* defaults */ }
   if (shop) cache.set(shop, { at: Date.now(), v });
   return v;
 }
 
-export async function saveModeration(admin: Admin, shop: string, next: Moderation) {
+/** Saves the given settings on top of the current ones. */
+export async function saveModeration(admin: Admin, shop: string, patch: Partial<Moderation>) {
+  const cur = await getModeration(admin, "");
+  const next = { ...cur, ...patch };
   const d = await gql(admin, `{ shop { id } }`);
   const value: Moderation = {
     buyers_only: !!next.buyers_only,
     auto_publish: !!next.auto_publish,
     extra_words: [...new Set(next.extra_words.map((w) => w.trim().toLowerCase()).filter(Boolean))].slice(0, 500),
+    spam_filter: !!next.spam_filter,
+    auto_block: Math.max(0, Math.min(20, Math.round(Number(next.auto_block) || 0))),
+    blocked: next.blocked.slice(0, 2000),
   };
   const r = await gql(admin, `mutation($m: [MetafieldsSetInput!]!) { metafieldsSet(metafields: $m) { userErrors { field message } } }`, {
     m: [{ ownerId: d.shop.id, namespace: NS, key: KEY, type: "json", value: JSON.stringify(value) }],
@@ -104,4 +125,66 @@ export async function saveModeration(admin: Admin, shop: string, next: Moderatio
   if (errs?.length) throw new Error(errs.map((e: any) => e.message).join(", "));
   cache.set(shop, { at: Date.now(), v: value });
   return value;
+}
+
+/* ───────────────────────── blocking ───────────────────────── */
+export const isBlocked = (mod: Moderation, customerId: string) => !!customerId && mod.blocked.some((b) => b.id === customerId);
+
+export async function blockUser(admin: Admin, shop: string, user: { id: string; name: string; reason: string }) {
+  const mod = await getModeration(admin, "");
+  if (isBlocked(mod, user.id)) return mod;
+  return saveModeration(admin, shop, {
+    blocked: [{ id: user.id, name: user.name.slice(0, 60), at: new Date().toISOString(), reason: user.reason.slice(0, 120) }, ...mod.blocked],
+  });
+}
+
+export async function unblockUser(admin: Admin, shop: string, id: string) {
+  const mod = await getModeration(admin, "");
+  return saveModeration(admin, shop, { blocked: mod.blocked.filter((b) => b.id !== id) });
+}
+
+/* ───────────────────────── spam ───────────────────────── */
+const PROMO = [
+  "earn money", "make money", "work from home", "whatsapp me", "whatsapp karo", "dm me", "dm for", "inbox me", "telegram",
+  "join my", "join our", "subscribe", "follow me", "follow my", "free followers", "click here", "click the link", "visit my",
+  "check my profile", "crypto", "bitcoin", "forex", "trading tips", "investment plan", "loan", "betting", "casino", "satta",
+  "lottery", "giveaway", "promo code", "discount code", "cheap price", "wholesale", "reseller", "call me", "contact me",
+];
+const LINK = /(https?:\/\/|www\.|\b[a-z0-9-]+\.(com|in|net|org|io|co|xyz|shop|store|link|me|ly|app|site|online)\b|wa\.me|t\.me|bit\.ly)/i;
+const PHONE = /(\+?\d[\d\s-]{8,}\d)/;
+
+const recent = new Map<string, { text: string; at: number }[]>(); // customer → last messages
+const strikes = new Map<string, number[]>(); // customer → spam strike times
+
+/** Why this message looks like spam ("" = fine). */
+export function spamReason(customerId: string, text: string): string {
+  const t = text.trim();
+  const low = t.toLowerCase();
+  if (LINK.test(low)) return "link";
+  if (PHONE.test(t) && t.replace(/\D/g, "").length >= 10) return "phone number";
+  if (PROMO.some((p) => low.includes(p))) return "promotion";
+  const letters = t.replace(/[^A-Za-z]/g, "");
+  if (letters.length >= 20 && letters.replace(/[^A-Z]/g, "").length / letters.length > 0.8) return "all caps";
+  if ((t.match(/\p{Extended_Pictographic}/gu) || []).length > 12) return "too many emojis";
+  if (/(.)\1{9,}/u.test(t) || /\b(\w+)\b(?:\s+\1\b){4,}/i.test(t)) return "repeated text";
+
+  const now = Date.now();
+  const mine = (recent.get(customerId) || []).filter((m) => now - m.at < 24 * 3600e3);
+  const norm = low.replace(/\s+/g, " ");
+  const dup = mine.some((m) => m.text === norm);
+  const burst = mine.filter((m) => now - m.at < 2 * 60e3).length >= 5;
+  mine.push({ text: norm, at: now });
+  recent.set(customerId, mine.slice(-30));
+  if (dup && norm.length > 3) return "same message again";
+  if (burst) return "too many messages at once";
+  return "";
+}
+
+/** Counts a spam strike; true when the shopper has now reached the automatic block. */
+export function addStrike(customerId: string, limit: number) {
+  const now = Date.now();
+  const list = (strikes.get(customerId) || []).filter((t) => now - t < 24 * 3600e3);
+  list.push(now);
+  strikes.set(customerId, list);
+  return limit > 0 && list.length >= limit;
 }

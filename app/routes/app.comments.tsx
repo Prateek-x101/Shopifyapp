@@ -137,6 +137,16 @@ function Item({ it, product }: { it: ReturnType<typeof useLoaderData<typeof load
         <button type="button" className="cm-btn danger" disabled={busy} onClick={() => { if (confirm("Delete this comment and its replies?")) send({ intent: "comment-delete" }); }}>
           Delete
         </button>
+        {c.type !== "store" && c.customerId && (
+          <button
+            type="button"
+            className="cm-btn danger"
+            disabled={busy}
+            onClick={() => { if (confirm(`Block ${c.name}? They won't be able to post reviews, comments or replies. This comment will be hidden.`)) send({ intent: "block-user", hide: "true" }); }}
+          >
+            Block user
+          </button>
+        )}
       </div>
     </div>
   );

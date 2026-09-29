@@ -18,6 +18,7 @@ import {
   uploadMedia,
 } from "../lib/reviews.server";
 import type { ReviewImage } from "../lib/reviews.server";
+import { blockUser } from "../lib/moderation.server";
 import { ReviewHeader, Thread, ThreadSummary, initials, peopleOf } from "../components/review-thread";
 
 const gidOf = (id: string) => `gid://shopify/Metaobject/${id}`;
@@ -99,6 +100,16 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     const status = fd.get("status") === "hidden" ? "hidden" : "approved";
     await updateComment(admin, session.shop, id, String(fd.get("commentId")), { status });
     return { ok: true, message: status === "hidden" ? "Hidden from the store" : "Shown on the store" };
+  }
+  if (intent === "block-user") {
+    // block the shopper who wrote this comment: they can't post reviews, comments or replies any more
+    const cur = await prisma.review.findUnique({ where: { id } });
+    const find = (list: any[]): any => { for (const c of list) { if (c.id === fd.get("commentId")) return c; const h = find(c.replies || []); if (h) return h; } return null; };
+    const node = cur ? find(normalizeComments(JSON.parse(cur.replies))) : null;
+    if (!node?.customerId) return { ok: false, message: "This comment isn't linked to a customer account" };
+    await blockUser(admin, session.shop, { id: String(node.customerId), name: node.name, reason: "Blocked by you" });
+    if (fd.get("hide") === "true") await updateComment(admin, session.shop, id, node.id, { status: "hidden" });
+    return { ok: true, message: `${node.name} is blocked` };
   }
   if (intent === "comment-delete") {
     await removeComment(admin, session.shop, id, String(fd.get("commentId") || ""));
