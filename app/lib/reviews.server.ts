@@ -15,7 +15,7 @@ export const SUMMARY_KEY = "summary";
 export const VOTES_NS = "vw_reviews";
 export const VOTES_KEY = "votes";
 import { SOURCES, STATUSES, countComments, normalizeComments } from "./reviews.shared";
-import type { ReviewComment } from "./reviews.shared";
+import type { BulkItem, ReviewComment } from "./reviews.shared";
 export { SOURCES, STATUSES, countComments, normalizeComments };
 export type { ReviewComment };
 const TOP_IN_SUMMARY = 6;
@@ -793,4 +793,93 @@ export async function listReviews(opts: {
     prisma.review.findMany({ where, orderBy, skip: (page - 1) * perPage, take: perPage }),
   ]);
   return { total, page, perPage, pages: Math.max(1, Math.ceil(total / perPage)), rows };
+}
+
+/* ───────────────────────── bulk upload ───────────────────────── */
+/** Photos by URL → Shopify files. Returns url → file (only the ones Shopify could fetch). */
+async function filesFromUrls(admin: Admin, urls: string[]) {
+  const out = new Map<string, ReviewImage>();
+  const ids = new Map<string, string>();
+  for (let i = 0; i < urls.length; i += 5) {
+    await Promise.all(urls.slice(i, i + 5).map(async (url) => {
+      try {
+        const d = await gql(admin, `mutation($files: [FileCreateInput!]!) { fileCreate(files: $files) { files { id } userErrors { message } } }`, {
+          files: [{ originalSource: url, contentType: "IMAGE", alt: "Customer review photo" }],
+        });
+        const id = d.fileCreate.files?.[0]?.id;
+        if (id) ids.set(id, url);
+      } catch { /* skip this photo */ }
+    }));
+  }
+  let waiting = [...ids.keys()];
+  for (let attempt = 0; attempt < 20 && waiting.length; attempt++) {
+    await new Promise((r) => setTimeout(r, 1500));
+    for (let i = 0; i < waiting.length; i += 50) {
+      const d = await gql(admin, `query($ids: [ID!]!) { nodes(ids: $ids) { ... on MediaImage { id fileStatus image { url } } } }`, { ids: waiting.slice(i, i + 50) });
+      d.nodes.forEach((n: any) => {
+        if (n?.image?.url) out.set(ids.get(n.id)!, { id: n.id, url: n.image.url, alt: "", kind: "image" });
+        if (n?.image?.url || n?.fileStatus === "FAILED") ids.delete(n.id);
+      });
+    }
+    waiting = [...ids.keys()];
+  }
+  return out;
+}
+
+/** Creates many reviews at once (max 200 per upload); the product summary is recomputed once at the end. */
+export async function importReviews(
+  admin: Admin,
+  shop: string,
+  productId: string,
+  items: BulkItem[],
+  opts: { status: string; verified: boolean; spreadDays: number },
+) {
+  await ensureDefinitions(admin);
+  const list = items.slice(0, 200);
+  const urls = [...new Set(list.flatMap((i) => [...(i.images || []), i.avatar || ""]).filter(Boolean))];
+  const files = urls.length ? await filesFromUrls(admin, urls) : new Map<string, ReviewImage>();
+  const now = Date.now();
+  const failed: string[] = [];
+  let created = 0;
+  let photoMisses = 0;
+
+  for (let i = 0; i < list.length; i += 5) {
+    await Promise.all(list.slice(i, i + 5).map(async (it) => {
+      const images = (it.images || []).map((u) => files.get(u)).filter(Boolean) as ReviewImage[];
+      photoMisses += (it.images || []).length - images.length;
+      const av = it.avatar ? files.get(it.avatar) : undefined;
+      const date = it.date || (opts.spreadDays > 0 ? new Date(now - Math.random() * opts.spreadDays * 86400000).toISOString() : new Date().toISOString());
+      const input: ReviewInput = {
+        productId,
+        rating: it.rating,
+        title: it.title || null,
+        body: it.body,
+        author: it.author,
+        location: it.location || null,
+        status: opts.status,
+        verified: it.verified ?? opts.verified,
+        source: "Import",
+        images,
+        avatar: av ? { id: av.id, url: av.url } : null,
+        replies: [],
+        helpful: it.helpful || 0,
+        featured: false,
+        createdAt: date,
+      };
+      try {
+        const d = await gql(admin, `mutation($m: MetaobjectCreateInput!) {
+          metaobjectCreate(metaobject: $m) { metaobject { ${MO_FIELDS} } userErrors { field message } } }`, {
+          m: { type: REVIEW_TYPE, fields: toFields(input) },
+        });
+        const errs = d.metaobjectCreate.userErrors;
+        if (errs?.length) throw new Error(errs.map((e: any) => e.message).join(", "));
+        await upsertIndex(fromMetaobject(shop, d.metaobjectCreate.metaobject));
+        created++;
+      } catch (e: any) {
+        failed.push(`${it.author}: ${e.message || "failed"}`);
+      }
+    }));
+  }
+  if (created) await recomputeSummary(admin, shop, productNum(productGid(productId)));
+  return { created, failed, skipped: items.length - list.length, photoMisses };
 }

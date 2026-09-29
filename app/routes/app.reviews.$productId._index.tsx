@@ -5,9 +5,11 @@ import { useAppBridge } from "@shopify/app-bridge-react";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
-import { deleteReview, gql, listReviews, patchReview } from "../lib/reviews.server";
+import { deleteReview, gql, importReviews, listReviews, patchReview, recomputeSummary } from "../lib/reviews.server";
 import { countComments, normalizeComments } from "../lib/reviews.shared";
 import { ReviewHeader, Thread, initials, peopleOf } from "../components/review-thread";
+import { BulkUpload } from "../components/bulk-upload";
+import type { BulkItem } from "../lib/reviews.shared";
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
@@ -68,11 +70,54 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   };
 };
 
-export const action = async ({ request }: ActionFunctionArgs) => {
+export const action = async ({ request, params }: ActionFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
   const fd = await request.formData();
   const intent = fd.get("intent") as string;
   const id = fd.get("id") as string;
+  if (intent === "bulk-import") {
+    let items: BulkItem[] = [];
+    try { items = JSON.parse(String(fd.get("payload") || "[]")); } catch { return { ok: false, message: "Could not read the reviews" }; }
+    if (!Array.isArray(items) || !items.length) return { ok: false, message: "Nothing to import" };
+    const status = ["published", "pending", "hidden"].includes(String(fd.get("status"))) ? String(fd.get("status")) : "published";
+    const r = await importReviews(admin, session.shop, params.productId!, items, {
+      status,
+      verified: fd.get("verified") === "true",
+      spreadDays: Math.max(0, Math.min(365, parseInt(String(fd.get("spreadDays") || "0"), 10) || 0)),
+    });
+    const bits = [`${r.created} review${r.created === 1 ? "" : "s"} added`];
+    if (r.failed.length) bits.push(`${r.failed.length} failed`);
+    if (r.photoMisses) bits.push(`${r.photoMisses} photo${r.photoMisses === 1 ? "" : "s"} could not be fetched`);
+    if (r.skipped) bits.push(`${r.skipped} over the 200 limit`);
+    return { ok: r.created > 0, message: bits.join(" · "), failed: r.failed.slice(0, 20) };
+  }
+  if (intent === "bulk") {
+    let ids: string[] = [];
+    try { ids = (JSON.parse(String(fd.get("ids") || "[]")) as string[]).filter((x) => typeof x === "string").slice(0, 250); } catch { ids = []; }
+    const op = String(fd.get("op") || "");
+    if (!ids.length) return { ok: false, message: "Select reviews first" };
+    const own = await prisma.review.findMany({ where: { shop: session.shop, id: { in: ids } }, select: { id: true } });
+    const run = async (rid: string) => {
+      if (op === "delete") return deleteReview(admin, session.shop, rid);
+      if (op === "published" || op === "pending" || op === "hidden") return patchReview(admin, session.shop, rid, { status: op });
+      if (op === "pin" || op === "unpin") return patchReview(admin, session.shop, rid, { featured: op === "pin" });
+      throw new Error("Unknown action");
+    };
+    let done = 0;
+    let failed = 0;
+    for (let i = 0; i < own.length; i += 4) {
+      const res = await Promise.allSettled(own.slice(i, i + 4).map((r) => run(r.id)));
+      res.forEach((x) => (x.status === "fulfilled" ? done++ : failed++));
+    }
+    await recomputeSummary(admin, session.shop, params.productId!); // once more, after the parallel updates settle
+    const verb: Record<string, string> = {
+      delete: "deleted", published: "published", pending: "moved to pending", hidden: "hidden", pin: "pinned", unpin: "unpinned",
+    };
+    return {
+      ok: done > 0,
+      message: `${done} review${done === 1 ? "" : "s"} ${verb[op] || "updated"}${failed ? ` · ${failed} failed` : ""}`,
+    };
+  }
   if (intent === "delete") {
     await deleteReview(admin, session.shop, id);
     return { ok: true, message: "Review deleted" };
@@ -149,6 +194,35 @@ export default function ProductReviews() {
   const navigate = useNavigate();
   const status = params.get("status") || "all";
 
+  // selection for bulk actions (current page)
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const pageIds = list.rows.map((r) => r.id);
+  const pageKey = pageIds.join(",");
+  useEffect(() => {
+    setSelected((cur) => new Set([...cur].filter((x) => pageIds.includes(x))));
+  }, [pageKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  const allOn = pageIds.length > 0 && pageIds.every((x) => selected.has(x));
+  const someOn = selected.size > 0 && !allOn;
+  const toggle = (rid: string) =>
+    setSelected((cur) => {
+      const n = new Set(cur);
+      if (n.has(rid)) n.delete(rid); else n.add(rid);
+      return n;
+    });
+  const bulk = useFetcher<typeof action>();
+  const shopify = useAppBridge();
+  const bulkBusy = bulk.state !== "idle";
+  useEffect(() => {
+    const d: any = bulk.data;
+    if (!d?.message) return;
+    shopify.toast.show(d.message, { isError: d.ok === false });
+    if (d.ok) setSelected(new Set());
+  }, [bulk.data, shopify]);
+  const runBulk = (op: string) => {
+    if (op === "delete" && !confirm(`Delete ${selected.size} review${selected.size === 1 ? "" : "s"} permanently?`)) return;
+    bulk.submit({ intent: "bulk", op, ids: JSON.stringify([...selected]) }, { method: "POST" });
+  };
+
   const go = (next: Record<string, string | null>) => {
     const p = new URLSearchParams(params);
     Object.entries(next).forEach(([k, v]) => (v === null || v === "" ? p.delete(k) : p.set(k, v)));
@@ -167,9 +241,19 @@ export default function ProductReviews() {
     <s-page heading={product.title} inlineSize="large">
       <s-link slot="breadcrumb-actions" href="/app/reviews">Reviews</s-link>
       <s-button slot="primary-action" variant="primary" href={`/app/reviews/${product.id}/new`}>Add review</s-button>
+      <s-button slot="secondary-actions" icon="upload" commandFor="bulk-modal" command="--show">Bulk upload</s-button>
       {product.url && (
         <s-button slot="secondary-actions" href={product.url} target="_blank">View on store</s-button>
       )}
+      <BulkUpload />
+      <style>{`
+        .rv-check { width: 16px; height: 16px; margin: 0; accent-color: #303030; cursor: pointer; }
+        .rv-bulkbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 10px; border: 1px solid #e3e3e3;
+          border-radius: 10px; background: #fafafa; font-size: 13px; }
+        .rv-bulk-count { font-weight: 600; color: #1f1f1f; }
+        .rv-bulk-link { border: 0; background: none; padding: 0; font: inherit; color: #616161; text-decoration: underline; cursor: pointer; }
+        .rv-bulk-sp { flex: 1; }
+      `}</style>
 
       <s-section padding="none">
         <s-table
@@ -212,9 +296,32 @@ export default function ProductReviews() {
                 With photos
               </s-button>
             </s-stack>
+            {selected.size > 0 && (
+              <div className="rv-bulkbar">
+                <span className="rv-bulk-count">{selected.size} selected</span>
+                <button type="button" className="rv-bulk-link" onClick={() => setSelected(new Set())}>Clear</button>
+                <span className="rv-bulk-sp" />
+                <s-button onClick={() => runBulk("published")} {...(bulkBusy ? { disabled: true } : {})}>Publish</s-button>
+                <s-button onClick={() => runBulk("hidden")} {...(bulkBusy ? { disabled: true } : {})}>Hide</s-button>
+                <s-button onClick={() => runBulk("pending")} {...(bulkBusy ? { disabled: true } : {})}>Pending</s-button>
+                <s-button icon="pin" onClick={() => runBulk("pin")} {...(bulkBusy ? { disabled: true } : {})}>Pin</s-button>
+                <s-button onClick={() => runBulk("unpin")} {...(bulkBusy ? { disabled: true } : {})}>Unpin</s-button>
+                <s-button tone="critical" icon="delete" onClick={() => runBulk("delete")} {...(bulkBusy ? { loading: true } : {})}>Delete</s-button>
+              </div>
+            )}
           </s-stack>
 
           <s-table-header-row>
+            <s-table-header>
+              <input
+                type="checkbox"
+                className="rv-check"
+                aria-label="Select all on this page"
+                checked={allOn}
+                ref={(el) => { if (el) el.indeterminate = someOn; }}
+                onChange={() => setSelected(allOn ? new Set() : new Set(pageIds))}
+              />
+            </s-table-header>
             <s-table-header listSlot="primary">Review</s-table-header>
             <s-table-header>Customer</s-table-header>
             <s-table-header>Status</s-table-header>
@@ -224,6 +331,9 @@ export default function ProductReviews() {
           <s-table-body>
             {list.rows.map((r) => (
               <s-table-row key={r.id}>
+                <s-table-cell>
+                  <input type="checkbox" className="rv-check" aria-label={`Select review by ${r.author}`} checked={selected.has(r.id)} onChange={() => toggle(r.id)} />
+                </s-table-cell>
                 <s-table-cell>
                   <s-stack gap="small-200">
                     <s-stack direction="inline" gap="small-200" alignItems="center">
