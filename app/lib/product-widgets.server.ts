@@ -123,7 +123,8 @@ export async function listProducts(admin: Admin, q: string, after?: string | nul
 /* ───────────────────────── one product, everything the editor needs ───────────────────────── */
 export async function loadProductWidgets(admin: Admin, productId: string) {
   const d = await gql(admin, `query($id: ID!) {
-    product(id: $id) { id title handle status onlineStoreUrl
+    shop { primaryDomain { url } }
+    product(id: $id) { id title handle status onlineStoreUrl onlineStorePreviewUrl
       featuredMedia { preview { image { url } } }
       media(first: 12) { nodes { ... on MediaImage { image { url } } } }
       options { name values }
@@ -156,6 +157,7 @@ export async function loadProductWidgets(admin: Admin, productId: string) {
       handle: p.handle as string,
       status: p.status as string,
       url: (p.onlineStoreUrl as string) || "",
+      domain: String(d.shop?.primaryDomain?.url || "").replace(/\/$/, ""),
       image: p.featuredMedia?.preview?.image?.url || "",
       images: (p.media?.nodes || []).map((m: any) => m?.image?.url).filter(Boolean) as string[],
       options: p.options as { name: string; values: string[] }[],
@@ -215,7 +217,8 @@ const choice = (v: unknown, list: readonly string[], dflt: string) => (list.incl
 const fileOf = (v: FormDataEntryValue | null) => (v && typeof v !== "string" && v.size > 0 ? v : null);
 
 export async function saveWidget(admin: Admin, productId: string, widget: string, fd: FormData) {
-  const data = JSON.parse(String(fd.get("data") || "{}"));
+  // one Save can carry several widgets: each sends its own "data_<widget>"
+  const data = JSON.parse(String(fd.get(`data_${widget}`) || fd.get("data") || "{}"));
 
   if (widget === "offer") {
     // data.mode: "default" = the theme's default offer, "offer" = data.offerId (or the offer being edited/created)
