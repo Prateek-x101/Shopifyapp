@@ -7,6 +7,7 @@ import { authenticate } from "../shopify.server";
 import { ensureSettingsDefinition, getSettings, saveSettings } from "../lib/settings.server";
 import { getModeration, saveModeration, unblockUser } from "../lib/moderation.server";
 import { repairWidget, widgetStatus } from "../lib/theme-repair.server";
+import { recomputeAllSummaries } from "../lib/reviews.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
@@ -16,7 +17,10 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     getModeration(admin),
     widgetStatus(admin).catch((e: any) => ({ theme: "", found: false, missing: [] as string[], error: String(e?.message || e) })),
   ]);
-  return { google_login: s.google_login, google_client_id: s.google_client_id, login_mode: s.login_mode, shop: session.shop, mod, widget };
+  return {
+    google_login: s.google_login, google_client_id: s.google_client_id, login_mode: s.login_mode, shop: session.shop, mod, widget,
+    banner: { mode: s.banner_mode, max: s.banner_max, min: s.banner_min_rating, shuffle: s.banner_shuffle },
+  };
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -30,6 +34,20 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       return { ok: true, message: `Widget repaired in "${r.theme}" (${r.done.length} fix${r.done.length === 1 ? "" : "es"})` };
     } catch (e: any) {
       return { ok: false, message: e?.message || "Could not update the theme" };
+    }
+  }
+  if (fd.get("intent") === "banner") {
+    try {
+      await saveSettings(admin, {
+        banner_mode: fd.get("banner_mode") === "selected" ? "selected" : "auto",
+        banner_max: parseInt(String(fd.get("banner_max") || "10"), 10),
+        banner_min_rating: parseInt(String(fd.get("banner_min_rating") || "4"), 10),
+        banner_shuffle: fd.get("banner_shuffle") === "on",
+      });
+      const n = await recomputeAllSummaries(admin, session.shop);
+      return { ok: true, message: `Banner saved and rebuilt on ${n} product${n === 1 ? "" : "s"}` };
+    } catch (e: any) {
+      return { ok: false, message: e?.message || "Could not save" };
     }
   }
   if (fd.get("intent") === "unblock") {
@@ -101,8 +119,13 @@ export default function Settings() {
   const fetcher = useFetcher<typeof action>();
   const modFetcher = useFetcher<typeof action>();
   const fixFetcher = useFetcher<typeof action>();
+  const bannerFetcher = useFetcher<typeof action>();
+  const [bMode, setBMode] = useState<string>(data.banner.mode);
   const shopify = useAppBridge();
   const w: any = data.widget;
+  useEffect(() => {
+    if (bannerFetcher.data?.message) shopify.toast.show(bannerFetcher.data.message, { isError: !bannerFetcher.data.ok });
+  }, [bannerFetcher.data, shopify]);
   useEffect(() => {
     if (fixFetcher.data?.message) shopify.toast.show(fixFetcher.data.message, { isError: !fixFetcher.data.ok });
   }, [fixFetcher.data, shopify]);
@@ -163,6 +186,37 @@ export default function Settings() {
           </s-stack>
         </s-section>
       </fetcher.Form>
+
+      <bannerFetcher.Form method="post">
+        <input type="hidden" name="intent" value="banner" />
+        <input type="hidden" name="banner_mode" value={bMode} />
+        <s-section heading="Review banner (“What our customers say”)">
+          <s-stack gap="base">
+            <s-choice-list label="Which reviews" name="banner_mode_choice" values={[bMode]} onChange={(e: any) => setBMode(e.currentTarget.values?.[0] || "auto")}>
+              <s-choice value="auto">
+                Chosen + pinned, then the best of the rest (recommended)
+                <s-text slot="details">Reviews you mark “Show in banner” and pinned ones come first; the banner is filled up with other reviews of the minimum stars below. No two cards with the same text or name.</s-text>
+              </s-choice>
+              <s-choice value="selected">
+                Only the reviews I choose
+                <s-text slot="details">Only “Show in banner” and pinned reviews (Reviews → select → Show in banner). With none chosen, it works like the option above.</s-text>
+              </s-choice>
+            </s-choice-list>
+            <s-grid gridTemplateColumns="1fr 1fr" gap="base">
+              <s-number-field label="Most cards in the banner" name="banner_max" min={1} max={30} step={1} defaultValue={String(data.banner.max)} />
+              <s-select label="Minimum stars (filled-up reviews)" name="banner_min_rating" value={String(data.banner.min)}>
+                <s-option value="5">5 stars only</s-option>
+                <s-option value="4">4 stars and up</s-option>
+                <s-option value="3">3 stars and up</s-option>
+              </s-select>
+            </s-grid>
+            <s-checkbox name="banner_shuffle" label="Random order on every visit" defaultChecked={data.banner.shuffle} />
+            <s-stack direction="inline" justifyContent="end">
+              <s-button type="submit" variant="primary" {...(bannerFetcher.state !== "idle" ? { loading: true } : {})}>Save</s-button>
+            </s-stack>
+          </s-stack>
+        </s-section>
+      </bannerFetcher.Form>
 
       <s-section heading="Storefront widget">
         <s-stack gap="base">

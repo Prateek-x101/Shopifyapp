@@ -40,6 +40,7 @@ export type ReviewInput = {
   replies?: ReviewReply[];
   helpful?: number;
   featured?: boolean;
+  banner?: boolean;                     // chosen for the "What our customers say" banner
   createdAt?: string;
 };
 
@@ -99,6 +100,13 @@ export async function ensureDefinitions(admin: Admin) {
       d: { fieldDefinitions: [{ create: { key: "avatar", name: "Reviewer picture", type: "file_reference", validations: [{ name: "file_type_options", value: '["Image"]' }] } }] },
     });
   }
+  if (def.metaobjectDefinitionByType && !keys.has("banner")) {
+    await gql(admin, `mutation($id: ID!, $d: MetaobjectDefinitionUpdateInput!) {
+      metaobjectDefinitionUpdate(id: $id, definition: $d) { metaobjectDefinition { id } userErrors { message } } }`, {
+      id: def.metaobjectDefinitionByType.id,
+      d: { fieldDefinitions: [{ create: { key: "banner", name: "Show in reviews banner", type: "boolean" } }] },
+    });
+  }
 
   const mf = await gql(admin, `{ metafieldDefinitions(first: 5, ownerType: PRODUCT, namespace: "${SUMMARY_NS}", key: "${SUMMARY_KEY}") { nodes { id } } }`);
   if (!mf.metafieldDefinitions.nodes.length) {
@@ -151,6 +159,7 @@ function toFields(r: ReviewInput) {
     { key: "featured", value: String(!!r.featured) },
     { key: "created", value: r.createdAt || new Date().toISOString() },
     { key: "avatar", value: r.avatar?.id || "" },
+    { key: "banner", value: String(!!r.banner) },
   ];
   return f;
 }
@@ -194,6 +203,7 @@ function fromMetaobject(shop: string, m: any) {
     replies: JSON.stringify(replies),
     helpful: parseInt(val("helpful") || "0", 10),
     featured: val("featured") === "true",
+    banner: val("banner") === "true",
     hasMedia: imgs.length > 0,
     ...commentState(replies),
     createdAt: new Date(val("created") || m.updatedAt),
@@ -265,7 +275,7 @@ export async function patchReview(admin: Admin, shop: string, id: string, patch:
   const merged: ReviewInput = {
     productId: cur.productId, rating: cur.rating, title: cur.title, body: cur.body, author: cur.author,
     location: cur.location, status: cur.status, verified: cur.verified, source: cur.source, orderId: cur.orderId,
-    images: JSON.parse(cur.images), replies: JSON.parse(cur.replies), helpful: cur.helpful, featured: cur.featured,
+    images: JSON.parse(cur.images), replies: JSON.parse(cur.replies), helpful: cur.helpful, featured: cur.featured, banner: cur.banner,
     avatar: cur.avatar ? JSON.parse(cur.avatar) : null,
     createdAt: cur.createdAt.toISOString(), ...patch,
   };
@@ -342,13 +352,76 @@ export async function recomputeSummary(admin: Admin, shop: string, productId: st
     preview_reviews: preview.map((r) => legacyReview(r)),
     updated_at: summary.updated,
   };
+  const banner = await bannerFor(admin, shop, productId);
   await gql(admin, `mutation($m: [MetafieldsSetInput!]!) { metafieldsSet(metafields: $m) { userErrors { message } } }`, {
     m: [
       { ownerId: productGid(productId), namespace: SUMMARY_NS, key: SUMMARY_KEY, type: "json", value: JSON.stringify(summary) },
       { ownerId: productGid(productId), namespace: LEGACY_NS, key: LEGACY_KEY, type: "json", value: JSON.stringify(legacy) },
+      { ownerId: productGid(productId), namespace: SUMMARY_NS, key: "banner", type: "json", value: JSON.stringify(banner) },
     ],
   });
   return summary;
+}
+
+/**
+ * Reviews for the "What our customers say" banner (product metafield vw_reviews.banner).
+ * Chosen (banner) and pinned reviews first; in "auto" mode the rest is filled with reviews of at least
+ * `banner_min_rating` stars. Near-identical texts and the same name twice are skipped, so every card is different.
+ * "selected" mode with nothing chosen falls back to auto, so the banner is never empty.
+ */
+async function bannerFor(admin: Admin, shop: string, productId: string) {
+  const { getSettings } = await import("./settings.server");
+  let cfg = { banner_mode: "auto", banner_max: 10, banner_min_rating: 4, banner_shuffle: true };
+  try { cfg = await getSettings(admin); } catch { /* defaults */ }
+  const rows = await prisma.review.findMany({
+    where: { shop, productId, status: "published" },
+    orderBy: [{ banner: "desc" }, { featured: "desc" }, { rating: "desc" }, { hasMedia: "desc" }, { createdAt: "desc" }],
+    take: 300,
+  });
+  const chosen = rows.filter((r) => r.banner || r.featured);
+  const auto = cfg.banner_mode === "auto" || !chosen.length;
+  const pool = auto ? rows.filter((r) => !r.banner && !r.featured && r.rating >= cfg.banner_min_rating && r.body.trim().length >= 12) : [];
+  const textKey = (t: string) => t.toLowerCase().replace(/[^a-z0-9ऀ-ॿ]+/g, " ").trim().split(" ").slice(0, 12).join(" ");
+  const seenText = new Set<string>();
+  const seenName = new Set<string>();
+  const picked: typeof rows = [];
+  for (const r of [...chosen, ...pool]) {
+    const k = textKey(r.body);
+    const n = r.author.trim().toLowerCase();
+    if (!k || seenText.has(k) || seenName.has(n)) continue;
+    seenText.add(k);
+    seenName.add(n);
+    picked.push(r);
+    if (picked.length >= cfg.banner_max) break;
+  }
+  return {
+    v: 1,
+    shuffle: !!cfg.banner_shuffle,
+    reviews: picked.map((r) => {
+      let avatar: string | null = null;
+      try { avatar = r.avatar ? JSON.parse(r.avatar).url || null : null; } catch { avatar = null; }
+      return {
+        id: r.id.split("/").pop(),
+        name: r.author,
+        avatar,
+        rating: r.rating,
+        text: r.body,
+        verified: r.verified,
+        location: r.location || "",
+        date: r.createdAt.toISOString(),
+        pinned: r.featured || r.banner,
+      };
+    }),
+  };
+}
+
+/** Rebuild every product's banner (after the banner settings change). */
+export async function recomputeAllSummaries(admin: Admin, shop: string) {
+  const products = await prisma.review.groupBy({ by: ["productId"], where: { shop } });
+  for (const p of products) {
+    try { await recomputeSummary(admin, shop, p.productId); } catch { /* next product */ }
+  }
+  return products.length;
 }
 
 /* ───────────────────────── votes (customer metafield) ───────────────────────── */

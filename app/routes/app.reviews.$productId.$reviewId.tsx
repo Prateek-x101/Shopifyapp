@@ -165,6 +165,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     replies: existing ? JSON.parse(existing.replies) : [],
     helpful: fd.has("helpful") ? Math.max(0, Math.min(99999, parseInt(String(fd.get("helpful") || "0"), 10) || 0)) : existing?.helpful || 0,
     featured: fd.get("featured") === "true",
+    banner: fd.has("banner") ? fd.get("banner") === "true" : !!existing?.banner,
     createdAt: createdRaw ? new Date(createdRaw + "T12:00:00+05:30").toISOString() : existing?.createdAt.toISOString(),
   };
 
@@ -188,6 +189,7 @@ export default function EditReview() {
   // right-column controls feed hidden inputs of the main form
   const [status, setStatus] = useState<string>(r.status || "published");
   const [featured, setFeatured] = useState<boolean>(!!r.featured);
+  const [banner, setBanner] = useState<boolean>(!!r.banner);
   const [verified, setVerified] = useState<boolean>(isNew ? true : !!r.verified);
   const [orderId, setOrderId] = useState<string>(r.orderId || "");
   const [avatarPreview, setAvatarPreview] = useState<string>(r.avatar?.url || "");
@@ -209,6 +211,7 @@ export default function EditReview() {
         <input type="hidden" name="intent" value="save" />
         <input type="hidden" name="status" value={status} />
         <input type="hidden" name="featured" value={String(featured)} />
+        <input type="hidden" name="banner" value={String(banner)} />
         <input type="hidden" name="verified" value={String(verified)} />
         <input type="hidden" name="orderId" value={orderId} />
         <input type="hidden" name="helpful" value={helpful} />
@@ -311,6 +314,12 @@ export default function EditReview() {
             <s-option value="hidden">Hidden</s-option>
           </s-select>
           <s-checkbox label="Pin to the top" checked={featured} onChange={(e: any) => setFeatured(!!e.currentTarget.checked)} />
+          <s-checkbox
+            label="Show in the reviews banner"
+            details="“What our customers say” on the product page"
+            checked={banner}
+            onChange={(e: any) => setBanner(!!e.currentTarget.checked)}
+          />
           <s-checkbox
             label="Verified buyer"
             details="Shows “✓ Verified buyer” on the store"

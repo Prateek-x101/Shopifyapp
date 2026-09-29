@@ -51,6 +51,7 @@ model Review {
   replies   String   @default("[]") // JSON: [{ id, author, text, isStore, createdAt }]
   helpful   Int      @default(0)
   featured  Boolean  @default(false)
+  banner    Boolean  @default(false) // shown in the "What our customers say" banner
   hasMedia  Boolean  @default(false)
   needsReply    Boolean   @default(false) // a comment thread ends with a customer message
   commentCount  Int       @default(0)

@@ -91,6 +91,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
           source: r.source,
           orderId: r.orderId,
           featured: r.featured,
+          banner: r.banner,
           helpful: r.helpful,
           media: (JSON.parse(r.images) as { url: string; kind?: string; poster?: string }[])
             .filter((i) => i.url)
@@ -189,6 +190,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       if (op === "published" || op === "pending" || op === "hidden") return patchReview(admin, session.shop, rid, { status: op }, quiet);
       if (op === "pin" || op === "unpin") return patchReview(admin, session.shop, rid, { featured: op === "pin" }, quiet);
       if (op === "verified" || op === "unverified") return patchReview(admin, session.shop, rid, { verified: op === "verified" }, quiet);
+      if (op === "banner" || op === "unbanner") return patchReview(admin, session.shop, rid, { banner: op === "banner" }, quiet);
       throw new Error("Unknown action");
     };
     let done = 0;
@@ -201,6 +203,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     const verb: Record<string, string> = {
       delete: "deleted", published: "published", pending: "moved to pending", hidden: "hidden", pin: "pinned", unpin: "unpinned",
       verified: "marked verified", unverified: "marked not verified",
+      banner: "added to the banner", unbanner: "removed from the banner",
     };
     return { ok: done > 0, message: `${done} review${done === 1 ? "" : "s"} ${verb[op] || "updated"}${failed ? ` · ${failed} failed` : ""}` };
   }
@@ -217,6 +220,11 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
   if (intent === "pin") {
     await patchReview(admin, session.shop, id, { featured: fd.get("featured") === "true" });
     return { ok: true, message: fd.get("featured") === "true" ? "Pinned to top" : "Unpinned" };
+  }
+  if (intent === "banner") {
+    const on = fd.get("banner") === "true";
+    await patchReview(admin, session.shop, id, { banner: on });
+    return { ok: true, message: on ? "Shown in the reviews banner" : "Removed from the reviews banner" };
   }
   if (intent === "verify") {
     await patchReview(admin, session.shop, id, { verified: fd.get("verified") === "true" });
@@ -444,6 +452,7 @@ function ReviewView({
   const status = pending?.get("intent") === "status" ? String(pending.get("status")) : r.status;
   const featured = pending?.get("intent") === "pin" ? pending.get("featured") === "true" : r.featured;
   const verified = pending?.get("intent") === "verify" ? pending.get("verified") === "true" : r.verified;
+  const inBanner = pending?.get("intent") === "banner" ? pending.get("banner") === "true" : r.banner;
 
   return (
     <div className="rp">
@@ -511,6 +520,9 @@ function ReviewView({
         </button>
         <button type="button" className={`rp-btn${verified ? " on" : ""}`} disabled={busy} onClick={() => send({ intent: "verify", verified: String(!verified) })}>
           ✓ {verified ? "Verified" : "Mark verified"}
+        </button>
+        <button type="button" className={`rp-btn${inBanner ? " on" : ""}`} disabled={busy} onClick={() => send({ intent: "banner", banner: String(!inBanner) })}>
+          ★ {inBanner ? "In banner" : "Show in banner"}
         </button>
         <button type="button" className="rp-btn" onClick={onConversation}>💬 Conversation</button>
         <a className="rp-btn" href={editUrl(productId, r.id)}>✎ Edit</a>
@@ -792,6 +804,14 @@ export default function ProductReviews() {
                   ))}
                 </select>
               </label>
+              <button
+                type="button"
+                className={`rv-chip${commentsVal === "replies" ? " on" : ""}`}
+                onClick={() => setComments(commentsVal === "replies" ? "" : "replies")}
+                title="Reviews whose comments have replies under them"
+              >
+                ↳ With replies <span className="n">{commentCounts.replies}</span>
+              </button>
               {(flaggedCount > 0 || needsCount > 0) && <span className="rv-sep" />}
               {flaggedCount > 0 && commentsVal !== "waiting" && (
                 <button type="button" className="rv-chip alert" onClick={() => setComments("waiting")} title="Comments with abusive words wait for your approval">
@@ -829,6 +849,8 @@ export default function ProductReviews() {
                 <s-button onClick={() => runBulk("hidden")} {...bb("hidden")}>Hide</s-button>
                 <s-button onClick={() => runBulk("pending")} {...bb("pending")}>Pending</s-button>
                 <s-button onClick={() => runBulk("verified")} {...bb("verified")}>Mark verified</s-button>
+                <s-button onClick={() => runBulk("banner")} {...bb("banner")}>Show in banner</s-button>
+                <s-button onClick={() => runBulk("unbanner")} {...bb("unbanner")}>Remove from banner</s-button>
                 <s-button icon="pin" onClick={() => runBulk("pin")} {...bb("pin")}>Pin</s-button>
                 <s-button onClick={() => runBulk("unpin")} {...bb("unpin")}>Unpin</s-button>
                 <s-button icon="export" onClick={() => runExport(false)} {...(exportBusy ? { loading: true } : {})}>Export</s-button>
@@ -882,6 +904,7 @@ export default function ProductReviews() {
                     <s-stack direction="inline" gap="small-200" alignItems="center">
                       <Stars n={r.rating} />
                       {r.featured && <s-badge tone="info" icon="pin">Pinned</s-badge>}
+                      {r.banner && <s-badge tone="success">In banner</s-badge>}
                       {r.abusive && <s-badge tone="critical">⚑ Abusive words</s-badge>}
                     </s-stack>
                     {r.title && <s-text type="strong">{r.title}</s-text>}
