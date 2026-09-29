@@ -5,7 +5,7 @@
  *   as a logged-in customer, and its token rides along on every call to the app proxy (/apps/engine).
  * - Signing in does not reload the page: the widget switches to the new customer and the reply that was typed is
  *   sent. If the widget is too old to switch, the page reloads and comes back to the same review / scroll position.
- * - The avatar next to the comment box opens the profile: orders, conversations, sign out (or the login sheet).
+ * - VWLogin.profile() (or any element with data-vw-profile) opens the profile: orders, conversations, sign out.
  */
 (function () {
     'use strict';
@@ -149,8 +149,7 @@
             '.vwp-btn{flex:1;height:42px;border-radius:21px;border:1px solid #dadce0;background:#fff;color:#141414;font:inherit;font-size:14px;font-weight:500;cursor:pointer;text-decoration:none;display:grid;place-items:center}',
             '.vwp-btn.dark{background:#141414;border-color:#141414;color:#fff}',
             '.vwp-skel{height:64px;border-radius:12px;background:linear-gradient(90deg,#f2f2f2,#fafafa,#f2f2f2);background-size:200% 100%;animation:vwp-sh 1.2s infinite;margin-bottom:8px}',
-            '@keyframes vwp-sh{to{background-position:-200% 0}}',
-            '.yt-me{cursor:pointer}'
+            '@keyframes vwp-sh{to{background-position:-200% 0}}'
         ].join('');
         document.head.appendChild(el);
     }
@@ -211,9 +210,6 @@
         var n = c && (c.firstName || c.name);
         document.querySelectorAll('.yt-me').forEach(function (me) {
             me.textContent = n ? String(n).charAt(0).toUpperCase() : '?';
-            me.setAttribute('title', n ? 'Your profile' : 'Log in');
-            me.setAttribute('role', 'button');
-            me.removeAttribute('aria-hidden');
         });
     }
 
@@ -356,9 +352,9 @@
             });
     }
 
-    // the avatar next to the comment box: profile when signed in, otherwise the login sheet
+    // anything marked data-vw-profile opens the profile (not used inside the review widget)
     document.addEventListener('click', function (e) {
-        var t = e.target && e.target.closest ? e.target.closest('.yt-me, [data-vw-profile]') : null;
+        var t = e.target && e.target.closest ? e.target.closest('[data-vw-profile]') : null;
         if (!t) return;
         e.preventDefault();
         profile();
