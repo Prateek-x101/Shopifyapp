@@ -2,7 +2,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useFetcher } from "react-router";
 import { useAppBridge } from "@shopify/app-bridge-react";
-import { parseBulkReviews } from "../lib/reviews.shared";
+import { countBulkComments, parseBulkReviews } from "../lib/reviews.shared";
 
 const SAMPLE_JSON = JSON.stringify(
   [
@@ -15,16 +15,34 @@ const SAMPLE_JSON = JSON.stringify(
       photos: ["https://example.com/photo1.jpg"],
       avatar: "",
       helpful: 4,
+      comments: [
+        {
+          name: "Priya",
+          text: "Is the size true to fit?",
+          date: "2026-09-13",
+          likes: 2,
+          replies: [
+            { name: "@store", text: "Yes, it's true to size. Order your usual size!" },
+            { name: "Rahul Sharma", text: "I took M, fits perfectly." },
+          ],
+        },
+      ],
     },
-    { name: "Priya", city: "Delhi", rating: 4, text: "Nice jacket, delivery was quick." },
+    { name: "Aman", city: "Delhi", rating: 4, text: "Nice jacket, delivery was quick." },
   ],
   null,
   2,
 );
 const SAMPLE_TXT = `# Name | City | Rating | Review text | Date (optional) | Photo URLs (optional, comma separated)
+# Under a review:  > comment   >> reply to it   >>> reply to the reply      (Name | Text | Date)
+# Use @store as the name to write as your store.
 Rahul Sharma | Pune | 5 | Fabric quality is great, fits perfectly. | 12/09/2026 |
-Priya | Delhi | 4 | Nice jacket, delivery was quick. | |
-Aman | Jaipur | 5 | Worth the price! | 2026-09-20 | https://example.com/a.jpg, https://example.com/b.jpg
+> Priya | Is the size true to fit? | 13/09/2026
+>> @store | Yes, it's true to size. Order your usual size!
+>> Rahul Sharma | I took M, fits perfectly.
+> Karan | Colour same as the photos?
+Aman | Delhi | 4 | Nice jacket, delivery was quick. | |
+Neha | Jaipur | 5 | Worth the price! | 2026-09-20 | https://example.com/a.jpg, https://example.com/b.jpg
 `;
 
 const dl = (text: string, type: string) => `data:${type};charset=utf-8,${encodeURIComponent(text)}`;
@@ -73,6 +91,7 @@ export function BulkUpload({ modalId = "bulk-modal" }: { modalId?: string }) {
 
   const parsed = useMemo(() => (raw.trim() ? parseBulkReviews(raw) : { items: [], errors: [] }), [raw]);
   const photos = parsed.items.reduce((n, i) => n + i.images.length + (i.avatar ? 1 : 0), 0);
+  const comments = parsed.items.reduce((n, i) => n + countBulkComments(i.comments), 0);
 
   const readFile = (f?: File | null) => {
     if (!f) return;
@@ -126,8 +145,9 @@ export function BulkUpload({ modalId = "bulk-modal" }: { modalId?: string }) {
           onChange={(e) => { setRaw(e.currentTarget.value); setFileName(""); }}
         />
         <div className="bu-help">
-          <b>Text:</b> one review per line — <code>Name | City | Rating | Review | Date | Photo URLs</code> (date and photos optional).{" "}
-          <b>JSON:</b> a list of <code>{"{ name, city, rating, text, date, photos, avatar, helpful }"}</code>.{" "}
+          <b>Text:</b> one review per line — <code>Name | City | Rating | Review | Date | Photo URLs</code> (date and photos optional).
+          Comments go under the review: <code>{"> Name | Text"}</code>, replies <code>{">> Name | Text"}</code>, deeper <code>{">>>"}</code>; name <code>@store</code> = your store.{" "}
+          <b>JSON:</b> a list of <code>{"{ name, city, rating, text, date, photos, avatar, helpful, comments: [{ name, text, date, likes, replies: [...] }] }"}</code>.{" "}
           Samples: <a href={dl(SAMPLE_TXT, "text/plain")} download="reviews-sample.txt">.txt</a> ·{" "}
           <a href={dl(SAMPLE_JSON, "application/json")} download="reviews-sample.json">.json</a>
         </div>
@@ -136,6 +156,7 @@ export function BulkUpload({ modalId = "bulk-modal" }: { modalId?: string }) {
           <>
             <div className="bu-sum">
               <b>{parsed.items.length} review{parsed.items.length === 1 ? "" : "s"} ready</b>
+              {comments > 0 && <span>{comments} comment{comments === 1 ? "" : "s"} &amp; replies</span>}
               {photos > 0 && <span>{photos} photo{photos === 1 ? "" : "s"} to fetch</span>}
               {parsed.errors.length > 0 && <span className="bad">{parsed.errors.length} skipped</span>}
               {parsed.items.length > 200 && <span className="bad">Only the first 200 are imported per upload</span>}
@@ -143,7 +164,7 @@ export function BulkUpload({ modalId = "bulk-modal" }: { modalId?: string }) {
             {parsed.items.length > 0 && (
               <table className="bu-table">
                 <thead>
-                  <tr><th>Name</th><th>City</th><th>Rating</th><th>Review</th><th>Date</th><th>Photos</th></tr>
+                  <tr><th>Name</th><th>City</th><th>Rating</th><th>Review</th><th>Date</th><th>Photos</th><th>Comments</th></tr>
                 </thead>
                 <tbody>
                   {parsed.items.slice(0, 6).map((it, i) => (
@@ -154,6 +175,7 @@ export function BulkUpload({ modalId = "bulk-modal" }: { modalId?: string }) {
                       <td className="t">{it.body}</td>
                       <td>{it.date ? new Date(it.date).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" }) : spread ? "random" : "today"}</td>
                       <td>{it.images.length || "—"}</td>
+                      <td>{countBulkComments(it.comments) || "—"}</td>
                     </tr>
                   ))}
                 </tbody>

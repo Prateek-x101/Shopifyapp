@@ -41,7 +41,30 @@ export function countComments(list: ReviewComment[]): number {
   return list.reduce((n, c) => n + 1 + countComments(c.replies || []), 0);
 }
 
+/** "Comments" filter on the reviews list. */
+export const COMMENT_FILTERS = {
+  with: "With comments",
+  without: "No comments",
+  replies: "With replies in the thread",
+  store: "Store has replied",
+  nostore: "Store hasn't replied",
+  needs: "Needs reply",
+  waiting: "Waiting for approval",
+} as const;
+export type CommentFilter = keyof typeof COMMENT_FILTERS;
+
 /* ───────────────────────── bulk upload ───────────────────────── */
+/** A comment (top level) or reply (nested) in a bulk upload. `store: true` = written as the store. */
+export type BulkComment = {
+  name: string;
+  text: string;
+  date?: string; // ISO
+  store?: boolean;
+  avatar?: string;
+  likes?: number;
+  replies: BulkComment[];
+};
+
 export type BulkItem = {
   author: string;
   rating: number;
@@ -53,6 +76,7 @@ export type BulkItem = {
   images: string[]; // photo URLs
   avatar?: string; // picture URL
   helpful?: number;
+  comments?: BulkComment[];
 };
 
 const pick = (o: any, keys: string[]) => {
@@ -76,15 +100,51 @@ const urlList = (v: unknown): string[] =>
     .map((x: any) => String(typeof x === "object" && x ? x.url || x.src || "" : x).trim())
     .filter((x) => /^https?:\/\//i.test(x));
 
+/** "@store", "store", "Vesturewears (store)" → written as the store. */
+const STORE_NAME = /^@?store$/i;
+const STORE_TAG = /\s*[([]store[)\]]\s*$/i;
+
+const MAX_COMMENTS = 60; // per review, all levels
+const MAX_DEPTH = 4;
+
+function toComment(o: any, where: string, errors: string[], depth: number, budget: { n: number }): BulkComment | null {
+  if (!o || typeof o !== "object") { errors.push(`${where}: comment is not an object`); return null; }
+  let name = String(pick(o, ["name", "author", "by", "user"]) ?? "").trim();
+  const text = String(pick(o, ["text", "comment", "message", "body", "reply"]) ?? "").trim();
+  if (!text) { errors.push(`${where}: comment text missing`); return null; }
+  if (budget.n >= MAX_COMMENTS) return null;
+  budget.n++;
+  const typ = String(pick(o, ["type"]) ?? "");
+  let store = o.store === true || /^(true|yes|1)$/i.test(String(pick(o, ["store", "isstore"]) ?? "")) || /^store$/i.test(typ);
+  if (STORE_NAME.test(name)) { store = true; name = ""; }
+  if (STORE_TAG.test(name)) { store = true; name = name.replace(STORE_TAG, ""); }
+  if (!name && !store) { errors.push(`${where}: comment name missing`); budget.n--; return null; }
+  const likes = parseInt(String(pick(o, ["likes", "likecount", "helpful"]) ?? ""), 10);
+  const kids = pick(o, ["replies", "children", "answers"]);
+  return {
+    name: name.slice(0, 60),
+    text: text.slice(0, 2000),
+    date: toDate(pick(o, ["date", "createdat", "created"])),
+    store: store || undefined,
+    avatar: urlList(pick(o, ["avatar", "picture", "photo"]))[0],
+    likes: Number.isFinite(likes) && likes > 0 ? likes : undefined,
+    replies: depth < MAX_DEPTH && Array.isArray(kids)
+      ? (kids.map((k: any, i: number) => toComment(k, `${where}.${i + 1}`, errors, depth + 1, budget)).filter(Boolean) as BulkComment[])
+      : [],
+  };
+}
+
 function toItem(o: any, where: string, errors: string[]): BulkItem | null {
   const author = String(pick(o, ["author", "name", "reviewer", "customer", "customername"]) ?? "").trim();
-  const body = String(pick(o, ["body", "text", "review", "content", "comment", "message"]) ?? "").trim();
+  const body = String(pick(o, ["body", "text", "review", "content", "message"]) ?? "").trim();
   const rating = Math.round(Number(pick(o, ["rating", "stars", "star", "score"]) ?? 5));
   if (!author) { errors.push(`${where}: name missing`); return null; }
   if (!body) { errors.push(`${where}: review text missing`); return null; }
   if (!(rating >= 1 && rating <= 5)) { errors.push(`${where}: rating must be 1–5`); return null; }
   const v = pick(o, ["verified", "verifiedbuyer"]);
-  const helpful = parseInt(String(pick(o, ["helpful", "likes", "helpfulcount"]) ?? ""), 10);
+  const helpful = parseInt(String(pick(o, ["helpful", "helpfulcount"]) ?? ""), 10);
+  const rawComments = pick(o, ["comments", "thread", "conversation"]);
+  const budget = { n: 0 };
   return {
     author: author.slice(0, 60),
     rating,
@@ -96,12 +156,21 @@ function toItem(o: any, where: string, errors: string[]): BulkItem | null {
     images: urlList(pick(o, ["images", "photos", "image", "photo", "media"])).slice(0, 6),
     avatar: urlList(pick(o, ["avatar", "picture", "profilepic", "photourl"]))[0],
     helpful: Number.isFinite(helpful) && helpful > 0 ? helpful : undefined,
+    comments: Array.isArray(rawComments)
+      ? (rawComments.map((c: any, i: number) => toComment(c, `${where} comment ${i + 1}`, errors, 1, budget)).filter(Boolean) as BulkComment[])
+      : undefined,
   };
 }
 
+export const countBulkComments = (list: BulkComment[] = []): number =>
+  list.reduce((n, c) => n + 1 + countBulkComments(c.replies), 0);
+
 /**
- * JSON: an array of reviews (or { "reviews": [...] }).
+ * JSON: an array of reviews (or { "reviews": [...] }), each may have "comments": [{ name, text, replies: [...] }].
  * Text: one review per line → Name | City | Rating | Review text | Date | photo URLs (comma separated).
+ *       Lines under a review starting with ">" are comments, ">>" replies to the comment above, ">>>" deeper:
+ *       > Priya | Is the size true to fit? | 14/09/2026
+ *       >> @store | Yes, it's true to size!
  */
 export function parseBulkReviews(raw: string): { items: BulkItem[]; errors: string[] } {
   const errors: string[] = [];
@@ -121,13 +190,35 @@ export function parseBulkReviews(raw: string): { items: BulkItem[]; errors: stri
     return { items, errors };
   }
 
+  let last: BulkItem | null = null; // review the ">" lines belong to
+  let lastBudget = { n: 0 };
+  const stack: BulkComment[] = []; // stack[d-1] = latest comment at depth d
   src.split(/\r?\n/).forEach((line, i) => {
     const l = line.trim();
     if (!l || l.startsWith("#")) return;
+
+    const quote = l.match(/^(>+)\s*(.*)$/);
+    if (quote) {
+      const depth = Math.min(quote[1].length, MAX_DEPTH);
+      if (!last) { errors.push(`Line ${i + 1}: comment before any review`); return; }
+      if (depth > stack.length + 1) { errors.push(`Line ${i + 1}: reply ("${quote[1]}") without a comment above it`); return; }
+      const [name, text, date] = quote[2].split("|").map((x) => x.trim());
+      const c = toComment({ name, text, date }, `Line ${i + 1}`, errors, depth, lastBudget);
+      if (!c) return;
+      if (depth === 1) (last.comments ||= []).push(c);
+      else stack[depth - 2].replies.push(c);
+      stack.length = depth - 1;
+      stack.push(c);
+      return;
+    }
+
     const parts = l.split(l.includes("|") ? "|" : "\t").map((x) => x.trim());
     if (i === 0 && /name/i.test(parts[0]) && parts.some((p) => /rating|stars/i.test(p))) return; // header row
     const [name, city, rating, text, date, photos] = parts;
     const it = toItem({ name, city, rating, text, date, photos }, `Line ${i + 1}`, errors);
+    last = it;
+    lastBudget = { n: 0 };
+    stack.length = 0;
     if (it) items.push(it);
   });
   return { items, errors };

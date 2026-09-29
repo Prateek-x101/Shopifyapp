@@ -15,7 +15,7 @@ export const SUMMARY_KEY = "summary";
 export const VOTES_NS = "vw_reviews";
 export const VOTES_KEY = "votes";
 import { SOURCES, STATUSES, countComments, normalizeComments } from "./reviews.shared";
-import type { BulkItem, ReviewComment } from "./reviews.shared";
+import type { BulkComment, BulkItem, CommentFilter, ReviewComment } from "./reviews.shared";
 export { SOURCES, STATUSES, countComments, normalizeComments };
 export type { ReviewComment };
 const TOP_IN_SUMMARY = 6;
@@ -776,8 +776,23 @@ export type ReviewFilters = {
   shop: string; productId: string; status?: string; rating?: number; media?: boolean; q?: string;
   customer?: boolean;               // written by shoppers in the widget (not added/imported by the store)
   from?: string; to?: string;       // YYYY-MM-DD, inclusive (India time)
-  flagged?: boolean;                // has comments waiting for approval
+  flagged?: boolean;                // has comments waiting for approval (same as comments: "waiting")
+  comments?: CommentFilter;
 };
+
+function commentWhere(f: CommentFilter | undefined): any[] {
+  const has = (s: string) => ({ replies: { contains: s } });
+  switch (f) {
+    case "with": return [{ commentCount: { gt: 0 } }];
+    case "without": return [{ commentCount: 0 }];
+    case "replies": return [has('"replies":[{')];              // some comment has a reply under it
+    case "store": return [has('"type":"store"')];
+    case "nostore": return [{ commentCount: { gt: 0 } }, { NOT: has('"type":"store"') }];
+    case "needs": return [{ needsReply: true }];
+    case "waiting": return [has('"status":"pending"')];
+    default: return [];
+  }
+}
 
 function reviewWhere(opts: ReviewFilters) {
   const where: any = { shop: opts.shop, productId: opts.productId };
@@ -785,7 +800,8 @@ function reviewWhere(opts: ReviewFilters) {
   if (opts.rating) where.rating = opts.rating;
   if (opts.media) where.hasMedia = true;
   if (opts.customer) where.source = "Website";
-  if (opts.flagged) where.replies = { contains: '"status":"pending"' };
+  const and = commentWhere(opts.flagged ? "waiting" : opts.comments);
+  if (and.length) where.AND = and;
   const day = (s: string | undefined, end: boolean) =>
     s && /^\d{4}-\d{2}-\d{2}$/.test(s) ? new Date(`${s}T${end ? "23:59:59.999" : "00:00:00"}+05:30`) : null;
   const from = day(opts.from, false);
@@ -854,17 +870,43 @@ async function filesFromUrls(admin: Admin, urls: string[]) {
   return out;
 }
 
+/** Bulk-upload comments → the thread the widget shows. Missing dates fall a few hours after the message above. */
+function bulkThread(list: BulkComment[] | undefined, after: number, shopName: string, avatars: Map<string, ReviewImage>, parent: string | null): ReviewComment[] {
+  let prev = after;
+  return (list || []).map((c) => {
+    const given = c.date ? Date.parse(c.date) : NaN;
+    const t = Number.isFinite(given) ? given : Math.min(Date.now(), prev + (2 + Math.random() * 20) * 3600000);
+    prev = Math.max(prev, t);
+    const id = `c_${t.toString(36)}${Math.random().toString(36).slice(2, 7)}`;
+    return {
+      id,
+      name: c.store ? c.name || shopName : c.name,
+      text: c.text,
+      date: new Date(t).toISOString(),
+      type: c.store ? "store" : "customer",
+      status: "approved",
+      avatar: c.avatar ? avatars.get(c.avatar)?.url || null : null,
+      customerId: null,
+      verified: false,
+      likeCount: c.likes || 0,
+      parentCommentId: parent,
+      replies: bulkThread(c.replies, t, shopName, avatars, id),
+    } as ReviewComment;
+  });
+}
+
 /** Creates many reviews at once (max 200 per upload); the product summary is recomputed once at the end. */
 export async function importReviews(
   admin: Admin,
   shop: string,
   productId: string,
   items: BulkItem[],
-  opts: { status: string; verified: boolean; spreadDays: number },
+  opts: { status: string; verified: boolean; spreadDays: number; shopName?: string },
 ) {
   await ensureDefinitions(admin);
   const list = items.slice(0, 200);
-  const urls = [...new Set(list.flatMap((i) => [...(i.images || []), i.avatar || ""]).filter(Boolean))];
+  const commentAvatars = (cs: BulkComment[] = []): string[] => cs.flatMap((c) => [c.avatar || "", ...commentAvatars(c.replies)]);
+  const urls = [...new Set(list.flatMap((i) => [...(i.images || []), i.avatar || "", ...commentAvatars(i.comments)]).filter(Boolean))];
   const files = urls.length ? await filesFromUrls(admin, urls) : new Map<string, ReviewImage>();
   const now = Date.now();
   const failed: string[] = [];
@@ -889,7 +931,7 @@ export async function importReviews(
         source: "Import",
         images,
         avatar: av ? { id: av.id, url: av.url } : null,
-        replies: [],
+        replies: bulkThread(it.comments, Date.parse(date), opts.shopName || "Store", files, null),
         helpful: it.helpful || 0,
         featured: false,
         createdAt: date,

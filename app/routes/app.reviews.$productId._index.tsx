@@ -1,6 +1,6 @@
 import type { ActionFunctionArgs, HeadersFunction, LoaderFunctionArgs } from "react-router";
 import { useFetcher, useLoaderData, useNavigate, useSearchParams } from "react-router";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
@@ -15,8 +15,8 @@ import {
   reviewIdsMatching,
 } from "../lib/reviews.server";
 import type { ReviewFilters } from "../lib/reviews.server";
-import { countComments, normalizeComments } from "../lib/reviews.shared";
-import type { BulkItem, ReviewComment } from "../lib/reviews.shared";
+import { COMMENT_FILTERS, countComments, normalizeComments } from "../lib/reviews.shared";
+import type { BulkItem, CommentFilter, ReviewComment } from "../lib/reviews.shared";
 import { ReviewHeader, Thread, initials, peopleOf } from "../components/review-thread";
 import { BulkUpload } from "../components/bulk-upload";
 import { getModeration, isAbusive } from "../lib/moderation.server";
@@ -31,6 +31,7 @@ function filtersFrom(sp: URLSearchParams, shop: string, productId: string): Revi
     media: sp.get("media") === "1",
     customer: sp.get("customer") === "1",
     flagged: sp.get("flagged") === "1",
+    comments: (sp.get("comments") || "") in COMMENT_FILTERS ? (sp.get("comments") as CommentFilter) : undefined,
     from: sp.get("from") || undefined,
     to: sp.get("to") || undefined,
     q: sp.get("q") || undefined,
@@ -46,7 +47,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const sp = new URL(request.url).searchParams;
   const base = { shop: session.shop, productId };
 
-  const [prod, list, counts, customerCount, flaggedCount, mod] = await Promise.all([
+  const [prod, list, counts, customerCount, flaggedCount, mod, needsCount] = await Promise.all([
     gql(admin, `query($id: ID!) { product(id: $id) { id title handle onlineStoreUrl featuredMedia { preview { image { url } } } } shop { name } }`, {
       id: `gid://shopify/Product/${productId}`,
     }),
@@ -55,6 +56,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     prisma.review.count({ where: { ...base, source: "Website" } }),
     prisma.review.count({ where: { ...base, replies: { contains: '"status":"pending"' } } }),
     getModeration(admin, session.shop),
+    prisma.review.count({ where: { ...base, needsReply: true } }),
   ]);
   if (!prod.product) throw new Response("Product not found", { status: 404 });
   const byStatus: Record<string, number> = { published: 0, pending: 0, hidden: 0 };
@@ -71,6 +73,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     byStatus,
     customerCount,
     flaggedCount,
+    needsCount,
     list: {
       ...list,
       rows: list.rows.map((r) => {
@@ -116,7 +119,9 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     try { items = JSON.parse(String(fd.get("payload") || "[]")); } catch { return { ok: false, message: "Could not read the reviews" }; }
     if (!Array.isArray(items) || !items.length) return { ok: false, message: "Nothing to import" };
     const status = ["published", "pending", "hidden"].includes(String(fd.get("status"))) ? String(fd.get("status")) : "published";
+    const shopName = (await gql(admin, `{ shop { name } }`)).shop.name as string;
     const r = await importReviews(admin, session.shop, productId, items, {
+      shopName,
       status,
       verified: fd.get("verified") === "true",
       spreadDays: Math.max(0, Math.min(365, parseInt(String(fd.get("spreadDays") || "0"), 10) || 0)),
@@ -128,15 +133,53 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     return { ok: r.created > 0, message: bits.join(" · "), failed: r.failed.slice(0, 20) };
   }
 
+  // selected rows (any page) or every review matching the filters the admin is looking at
+  const selectedIds = async () => {
+    if (fd.get("scope") === "all") {
+      return reviewIdsMatching(filtersFrom(new URLSearchParams(String(fd.get("filters") || "")), session.shop, productId));
+    }
+    try { return (JSON.parse(String(fd.get("ids") || "[]")) as string[]).filter((x) => typeof x === "string").slice(0, 1000); } catch { return []; }
+  };
+
+  if (intent === "export") {
+    const ids = await selectedIds();
+    if (!ids.length) return { ok: false, message: "Nothing to export" };
+    const rows = await prisma.review.findMany({ where: { shop: session.shop, productId, id: { in: ids } }, orderBy: { createdAt: "desc" } });
+    const thread = (list: ReviewComment[]): any[] =>
+      list.map((c) => ({
+        name: c.type === "store" ? "@store" : c.name,
+        text: c.text,
+        date: c.date,
+        ...(c.likeCount ? { likes: c.likeCount } : {}),
+        ...(c.avatar ? { avatar: c.avatar } : {}),
+        ...(c.status !== "approved" ? { status: c.status } : {}),
+        ...(c.replies?.length ? { replies: thread(c.replies) } : {}),
+      }));
+    const data = rows.map((r) => {
+      const media = JSON.parse(r.images) as { url: string; kind?: string }[];
+      const comments = thread(normalizeComments(JSON.parse(r.replies)));
+      return {
+        name: r.author,
+        city: r.location || "",
+        rating: r.rating,
+        ...(r.title ? { title: r.title } : {}),
+        text: r.body,
+        date: r.createdAt.toISOString(),
+        status: r.status,
+        verified: r.verified,
+        helpful: r.helpful,
+        source: r.source,
+        photos: media.filter((m) => m.url && m.kind !== "video").map((m) => m.url),
+        ...(r.avatar ? { avatar: JSON.parse(r.avatar).url } : {}),
+        ...(comments.length ? { comments } : {}),
+      };
+    });
+    return { ok: true, message: `${data.length} review${data.length === 1 ? "" : "s"} exported`, export: data };
+  }
+
   if (intent === "bulk") {
     const op = String(fd.get("op") || "");
-    let ids: string[] = [];
-    if (fd.get("scope") === "all") {
-      // every review matching the filters the admin is looking at (all pages)
-      ids = await reviewIdsMatching(filtersFrom(new URLSearchParams(String(fd.get("filters") || "")), session.shop, productId));
-    } else {
-      try { ids = (JSON.parse(String(fd.get("ids") || "[]")) as string[]).filter((x) => typeof x === "string").slice(0, 1000); } catch { ids = []; }
-    }
+    const ids = await selectedIds();
     if (!ids.length) return { ok: false, message: "Select reviews first" };
     const own = await prisma.review.findMany({ where: { shop: session.shop, productId, id: { in: ids } }, select: { id: true } });
     const quiet = { skipSummary: true }; // the summary is recomputed once at the end
@@ -223,6 +266,23 @@ const CSS = `
 .rv-chip.on { background: #303030; border-color: #303030; color: #fff; }
 .rv-chip .n { font-size: 11px; opacity: .7; }
 .rv-chip.alert:not(.on) .n { color: #b42318; opacity: 1; font-weight: 600; }
+.rv-chip .caret { font-size: 9px; opacity: .6; }
+.rv-pick { position: relative; }
+.rv-pick select { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+.rv-dd { position: relative; }
+.rv-pop { position: fixed; z-index: 1000; display: flex; gap: 0; background: #fff; border: 1px solid #e3e3e3;
+  border-radius: 12px; box-shadow: 0 12px 32px rgba(0,0,0,.12); overflow: hidden; font-size: 13px; }
+.rv-pop-presets { display: grid; padding: 6px; border-right: 1px solid #f1f1f1; min-width: 140px; }
+.rv-pop-presets button { text-align: left; border: 0; background: none; padding: 7px 10px; border-radius: 8px; font: inherit; font-size: 13px; color: #303030; cursor: pointer; }
+.rv-pop-presets button:hover { background: #f5f5f5; }
+.rv-pop-presets button.on { background: #303030; color: #fff; }
+.rv-pop-custom { display: grid; gap: 8px; padding: 12px 14px; align-content: start; min-width: 220px; }
+.rv-pop-title { font-weight: 600; color: #1f1f1f; }
+.rv-pop-custom label { display: grid; gap: 4px; font-size: 12px; color: #8a8a8a; }
+.rv-pop-custom input { border: 1px solid #dcdcdc; border-radius: 8px; padding: 6px 8px; font: inherit; font-size: 13px; color: #303030; }
+.rv-pop-btns { display: flex; gap: 6px; justify-content: flex-end; margin-top: 4px; }
+.rp-btn.dark { background: #303030; border-color: #303030; color: #fff; }
+.rv-bulk-note { color: #616161; font-size: 12.5px; }
 .rv-date { display: inline-flex; align-items: center; gap: 6px; height: 30px; padding: 0 4px 0 10px; border: 1px solid #dcdcdc; border-radius: 999px;
   background: #fff; font-size: 12.5px; color: #616161; }
 .rv-date.on { border-color: #303030; }
@@ -462,9 +522,82 @@ function ReviewView({
   );
 }
 
+/* ───────────────────────── date filter ───────────────────────── */
+const PRESETS: { label: string; range: () => [string, string] }[] = [
+  { label: "Today", range: () => [dayStr(0), dayStr(0)] },
+  { label: "Yesterday", range: () => [dayStr(1), dayStr(1)] },
+  { label: "Last 7 days", range: () => [dayStr(6), ""] },
+  { label: "Last 30 days", range: () => [dayStr(29), ""] },
+  { label: "Last 90 days", range: () => [dayStr(89), ""] },
+  { label: "This month", range: () => [dayStr(0).slice(0, 8) + "01", ""] },
+  {
+    label: "Last month",
+    range: () => {
+      const d = new Date(dayStr(0) + "T12:00:00Z");
+      const first = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() - 1, 1));
+      const last = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 0));
+      return [first.toISOString().slice(0, 10), last.toISOString().slice(0, 10)];
+    },
+  },
+  { label: "This year", range: () => [dayStr(0).slice(0, 5) + "01-01", ""] },
+];
+const shortDate = (s: string) => new Date(s + "T12:00:00+05:30").toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" });
+
+function DateFilter({ from, to, onApply }: { from: string; to: string; onApply: (from: string, to: string) => void }) {
+  const [open, setOpen] = useState(false);
+  const [pos, setPos] = useState<{ top: number; left: number }>({ top: 0, left: 0 });
+  const [f, setF] = useState(from);
+  const [t, setT] = useState(to);
+  const box = useRef<HTMLDivElement>(null);
+  useEffect(() => { setF(from); setT(to); }, [from, to]);
+  useEffect(() => {
+    if (!open) return;
+    const close = (e: MouseEvent) => { if (box.current && !box.current.contains(e.target as Node)) setOpen(false); };
+    const esc = (e: KeyboardEvent) => { if (e.key === "Escape") setOpen(false); };
+    document.addEventListener("mousedown", close);
+    document.addEventListener("keydown", esc);
+    return () => { document.removeEventListener("mousedown", close); document.removeEventListener("keydown", esc); };
+  }, [open]);
+
+  const active = PRESETS.find((p) => { const [a, b] = p.range(); return a === from && b === to; });
+  const label = !from && !to ? "Any date" : active ? active.label : from && to ? (from === to ? shortDate(from) : `${shortDate(from)} – ${shortDate(to)}`) : from ? `From ${shortDate(from)}` : `Until ${shortDate(to)}`;
+  const apply = (a: string, b: string) => { onApply(a, b); setOpen(false); };
+
+  return (
+    <div className="rv-dd" ref={box}>
+      <button type="button" className={`rv-chip${from || to ? " on" : ""}`} onClick={(e) => {
+        // fixed position, so the table around it can never clip the panel
+        const r = e.currentTarget.getBoundingClientRect();
+        setPos({ top: r.bottom + 6, left: Math.max(8, Math.min(r.left, window.innerWidth - 390)) });
+        setOpen(!open);
+      }} aria-expanded={open}>
+        📅 {label} <span className="caret">▾</span>
+      </button>
+      {open && (
+        <div className="rv-pop" role="dialog" aria-label="Date range" style={{ top: pos.top, left: pos.left }}>
+          <div className="rv-pop-presets">
+            {PRESETS.map((p) => (
+              <button key={p.label} type="button" className={active?.label === p.label ? "on" : ""} onClick={() => apply(...p.range())}>{p.label}</button>
+            ))}
+          </div>
+          <div className="rv-pop-custom">
+            <div className="rv-pop-title">Custom range</div>
+            <label>From <input type="date" value={f} max={t || undefined} onChange={(e) => setF(e.currentTarget.value)} /></label>
+            <label>To <input type="date" value={t} min={f || undefined} onChange={(e) => setT(e.currentTarget.value)} /></label>
+            <div className="rv-pop-btns">
+              <button type="button" className="rp-btn" onClick={() => apply("", "")}>Any date</button>
+              <button type="button" className="rp-btn dark" disabled={!f && !t} onClick={() => apply(f, t)}>Apply</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ───────────────────────── page ───────────────────────── */
 export default function ProductReviews() {
-  const { product, shopName, byStatus, customerCount, flaggedCount, list } = useLoaderData<typeof loader>();
+  const { product, shopName, byStatus, customerCount, flaggedCount, needsCount, list } = useLoaderData<typeof loader>();
   const [params] = useSearchParams();
   const navigate = useNavigate();
   const shopify = useAppBridge();
@@ -490,13 +623,21 @@ export default function ProductReviews() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [allMatching, setAllMatching] = useState(false);
   const pageIds = list.rows.map((r) => r.id);
-  const pageKey = pageIds.join(",") + "|" + params.toString();
+  // the selection survives paging and sorting; it resets only when the filters change (a different set of reviews)
+  const filterKey = (() => {
+    const p = new URLSearchParams(params);
+    p.delete("page");
+    p.delete("sort");
+    p.sort();
+    return p.toString();
+  })();
   useEffect(() => {
-    setSelected((cur) => new Set([...cur].filter((x) => pageIds.includes(x))));
+    setSelected(new Set());
     setAllMatching(false);
-  }, [pageKey]); // eslint-disable-line react-hooks/exhaustive-deps
-  const allOn = pageIds.length > 0 && pageIds.every((x) => selected.has(x));
-  const someOn = selected.size > 0 && !allOn;
+  }, [filterKey]);
+  const onPage = pageIds.filter((x) => selected.has(x)).length;
+  const allOn = pageIds.length > 0 && (allMatching || onPage === pageIds.length);
+  const someOn = !allOn && onPage > 0;
   const count = allMatching ? list.total : selected.size;
   const toggle = (rid: string) => {
     setAllMatching(false);
@@ -529,6 +670,34 @@ export default function ProductReviews() {
   };
   const bb = (op: string) => ({ ...(bulkBusy ? (bulkOp === op ? { loading: true } : { disabled: true }) : {}) });
 
+  // export (same JSON format as Bulk upload, so it can be edited and uploaded again)
+  const exp = useFetcher<typeof action>();
+  const exportBusy = exp.state !== "idle";
+  useEffect(() => {
+    const d: any = exp.data;
+    if (!d?.message) return;
+    shopify.toast.show(d.message, { isError: d.ok === false });
+    if (!d.export) return;
+    const blob = new Blob([JSON.stringify(d.export, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `reviews-${product.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "")}-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  }, [exp.data, shopify]); // eslint-disable-line react-hooks/exhaustive-deps
+  const runExport = (everything: boolean) => {
+    const f = new URLSearchParams(params);
+    f.delete("page");
+    exp.submit(
+      everything || allMatching
+        ? { intent: "export", scope: "all", filters: f.toString() }
+        : { intent: "export", ids: JSON.stringify([...selected]) },
+      { method: "POST" },
+    );
+  };
+
   const go = (next: Record<string, string | null>) => {
     const p = new URLSearchParams(params);
     Object.entries(next).forEach(([k, v]) => (v === null || v === "" ? p.delete(k) : p.set(k, v)));
@@ -536,10 +705,10 @@ export default function ProductReviews() {
     navigate(`/app/reviews/${product.id}?${p.toString()}`);
   };
   const flag = (k: string) => params.get(k) === "1";
-  const from = params.get("from") || "";
-  const to = params.get("to") || "";
-  const preset = from && !to ? ({ [dayStr(7)]: "7", [dayStr(30)]: "30", [dayStr(90)]: "90" } as Record<string, string>)[from] || "" : "";
-  const anyFilter = ["q", "rating", "media", "customer", "flagged", "from", "to"].some((k) => params.get(k));
+  const commentsVal = params.get("comments") || (flag("flagged") ? "waiting" : "");
+  const setComments = (v: string) => go({ comments: v || null, flagged: null });
+  const anyFilter = ["q", "rating", "media", "customer", "flagged", "comments", "from", "to"].some((k) => params.get(k));
+  const clearAll = { q: null, rating: null, media: null, customer: null, flagged: null, comments: null, from: null, to: null };
 
   const tabs: [string, string][] = [
     ["all", `All (${byStatus.published + byStatus.pending + byStatus.hidden})`],
@@ -553,6 +722,9 @@ export default function ProductReviews() {
       <s-link slot="breadcrumb-actions" href="/app/reviews">Reviews</s-link>
       <s-button slot="primary-action" variant="primary" href={`/app/reviews/${product.id}/new`}>Add review</s-button>
       <s-button slot="secondary-actions" icon="upload" commandFor="bulk-modal" command="--show">Bulk upload</s-button>
+      <s-button slot="secondary-actions" icon="export" onClick={() => runExport(true)} {...(exportBusy ? { loading: true } : {})}>
+        Export{anyFilter || status !== "all" ? " filtered" : ""}
+      </s-button>
       {product.url && (
         <s-button slot="secondary-actions" href={product.url} target="_blank">View on store</s-button>
       )}
@@ -605,37 +777,31 @@ export default function ProductReviews() {
               <button type="button" className={`rv-chip${flag("customer") ? " on" : ""}`} onClick={() => go({ customer: flag("customer") ? null : "1" })}>
                 👤 Customer reviews <span className="n">{customerCount}</span>
               </button>
-              <button
-                type="button"
-                className={`rv-chip alert${flag("flagged") ? " on" : ""}`}
-                onClick={() => go({ flagged: flag("flagged") ? null : "1" })}
-                title="Comments with abusive words wait here for your approval"
-              >
-                ⚑ Comments waiting <span className="n">{flaggedCount}</span>
-              </button>
-              <span className="rv-sep" />
-              <label className={`rv-date${from || to ? " on" : ""}`}>
-                📅
-                <select value={preset} onChange={(e) => {
-                  const v = e.currentTarget.value;
-                  go(v ? { from: dayStr(parseInt(v, 10)), to: null } : { from: null, to: null });
-                }} aria-label="Date range">
-                  <option value="">{from || to ? "Custom" : "Any date"}</option>
-                  <option value="7">Last 7 days</option>
-                  <option value="30">Last 30 days</option>
-                  <option value="90">Last 90 days</option>
+              <label className={`rv-chip rv-pick${commentsVal ? " on" : ""}`}>
+                💬 {commentsVal ? COMMENT_FILTERS[commentsVal as CommentFilter] : "Comments"} <span className="caret">▾</span>
+                <select value={commentsVal} onChange={(e) => setComments(e.currentTarget.value)} aria-label="Comments filter">
+                  <option value="">Any comments</option>
+                  {(Object.keys(COMMENT_FILTERS) as CommentFilter[]).map((k) => (
+                    <option key={k} value={k}>
+                      {COMMENT_FILTERS[k]}{k === "waiting" ? ` (${flaggedCount})` : k === "needs" ? ` (${needsCount})` : ""}
+                    </option>
+                  ))}
                 </select>
               </label>
-              <label className={`rv-date${from ? " on" : ""}`}>
-                From <input type="date" value={from} max={to || undefined} onChange={(e) => go({ from: e.currentTarget.value || null })} />
-              </label>
-              <label className={`rv-date${to ? " on" : ""}`}>
-                To <input type="date" value={to} min={from || undefined} onChange={(e) => go({ to: e.currentTarget.value || null })} />
-              </label>
-              {anyFilter && (
-                <button type="button" className="rv-clear" onClick={() => go({ q: null, rating: null, media: null, customer: null, flagged: null, from: null, to: null })}>
-                  Clear filters
+              <DateFilter from={params.get("from") || ""} to={params.get("to") || ""} onApply={(f, t) => go({ from: f || null, to: t || null })} />
+              {(flaggedCount > 0 || needsCount > 0) && <span className="rv-sep" />}
+              {flaggedCount > 0 && commentsVal !== "waiting" && (
+                <button type="button" className="rv-chip alert" onClick={() => setComments("waiting")} title="Comments with abusive words wait for your approval">
+                  ⚑ Waiting <span className="n">{flaggedCount}</span>
                 </button>
+              )}
+              {needsCount > 0 && commentsVal !== "needs" && (
+                <button type="button" className="rv-chip alert" onClick={() => setComments("needs")} title="A customer's message is the latest in the thread">
+                  ↩ Needs reply <span className="n">{needsCount}</span>
+                </button>
+              )}
+              {anyFilter && (
+                <button type="button" className="rv-clear" onClick={() => go(clearAll)}>Clear filters</button>
               )}
             </div>
 
@@ -644,9 +810,12 @@ export default function ProductReviews() {
                 <span className="rv-bulk-count">
                   {allMatching ? `All ${list.total} matching reviews selected` : `${selected.size} selected`}
                 </span>
-                {!allMatching && allOn && list.total > pageIds.length && (
+                {!allMatching && selected.size > onPage && (
+                  <span className="rv-bulk-note">{onPage} on this page · {selected.size - onPage} on other pages</span>
+                )}
+                {!allMatching && list.total > selected.size && (
                   <button type="button" className="rv-link" onClick={() => setAllMatching(true)}>
-                    Select all {list.total} reviews
+                    Select all {list.total}
                   </button>
                 )}
                 <button type="button" className="rv-link muted" onClick={clearSel}>Clear</button>
@@ -657,6 +826,7 @@ export default function ProductReviews() {
                 <s-button onClick={() => runBulk("verified")} {...bb("verified")}>Mark verified</s-button>
                 <s-button icon="pin" onClick={() => runBulk("pin")} {...bb("pin")}>Pin</s-button>
                 <s-button onClick={() => runBulk("unpin")} {...bb("unpin")}>Unpin</s-button>
+                <s-button icon="export" onClick={() => runExport(false)} {...(exportBusy ? { loading: true } : {})}>Export</s-button>
                 <s-button tone="critical" icon="delete" onClick={() => runBulk("delete")} {...bb("delete")}>Delete</s-button>
               </div>
             )}
@@ -670,7 +840,14 @@ export default function ProductReviews() {
                 aria-label="Select all on this page"
                 checked={allOn}
                 ref={(el) => { if (el) el.indeterminate = someOn; }}
-                onChange={() => { setAllMatching(false); setSelected(allOn ? new Set() : new Set(pageIds)); }}
+                onChange={() => {
+                  if (allMatching) { clearSel(); return; }
+                  setSelected((cur) => {
+                    const n = new Set(cur);
+                    pageIds.forEach((x) => (allOn ? n.delete(x) : n.add(x)));
+                    return n;
+                  });
+                }}
               />
             </s-table-header>
             <s-table-header listSlot="primary">Review</s-table-header>
@@ -689,6 +866,7 @@ export default function ProductReviews() {
                     aria-label={`Select review by ${r.author}`}
                     checked={allMatching || selected.has(r.id)}
                     onChange={() => {
+                      // leaving "all matching": keep this page selected except the one unticked
                       if (allMatching) { setAllMatching(false); setSelected(new Set(pageIds.filter((x) => x !== r.id))); }
                       else toggle(r.id);
                     }}
@@ -763,7 +941,7 @@ export default function ProductReviews() {
             <s-stack gap="base" alignItems="center">
               <s-heading>{anyFilter || status !== "all" ? "No reviews match these filters" : "No reviews here yet"}</s-heading>
               {anyFilter || status !== "all" ? (
-                <s-button onClick={() => go({ q: null, rating: null, media: null, customer: null, flagged: null, from: null, to: null, status: null })}>
+                <s-button onClick={() => go({ ...clearAll, status: null })}>
                   Clear filters
                 </s-button>
               ) : (
