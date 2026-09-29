@@ -814,6 +814,13 @@ function reviewWhere(opts: ReviewFilters) {
   return where;
 }
 
+/** How many of this product's reviews each "Comments" filter option would show. */
+export async function commentFilterCounts(shop: string, productId: string) {
+  const keys: CommentFilter[] = ["with", "without", "replies", "store", "nostore", "needs", "waiting"];
+  const counts = await Promise.all(keys.map((k) => prisma.review.count({ where: reviewWhere({ shop, productId, comments: k }) })));
+  return Object.fromEntries(keys.map((k, i) => [k, counts[i]])) as Record<CommentFilter, number>;
+}
+
 /** Every review id that matches the filters (for "select all" bulk actions). */
 export async function reviewIdsMatching(opts: ReviewFilters, limit = 1000) {
   const rows = await prisma.review.findMany({ where: reviewWhere(opts), select: { id: true }, orderBy: { createdAt: "desc" }, take: limit });

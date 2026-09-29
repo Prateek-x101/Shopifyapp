@@ -13,6 +13,7 @@ import {
   patchReview,
   recomputeSummary,
   reviewIdsMatching,
+  commentFilterCounts,
 } from "../lib/reviews.server";
 import type { ReviewFilters } from "../lib/reviews.server";
 import { COMMENT_FILTERS, countComments, normalizeComments } from "../lib/reviews.shared";
@@ -47,16 +48,16 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const sp = new URL(request.url).searchParams;
   const base = { shop: session.shop, productId };
 
-  const [prod, list, counts, customerCount, flaggedCount, mod, needsCount] = await Promise.all([
+  const [prod, list, counts, customerCount, commentCounts, mod, mediaCount] = await Promise.all([
     gql(admin, `query($id: ID!) { product(id: $id) { id title handle onlineStoreUrl featuredMedia { preview { image { url } } } } shop { name } }`, {
       id: `gid://shopify/Product/${productId}`,
     }),
     listReviews({ ...filtersFrom(sp, session.shop, productId), page: parseInt(sp.get("page") || "1", 10), sort: (sp.get("sort") as any) || "newest" }),
     prisma.review.groupBy({ by: ["status"], where: base, _count: true }),
     prisma.review.count({ where: { ...base, source: "Website" } }),
-    prisma.review.count({ where: { ...base, replies: { contains: '"status":"pending"' } } }),
+    commentFilterCounts(session.shop, productId),
     getModeration(admin, session.shop),
-    prisma.review.count({ where: { ...base, needsReply: true } }),
+    prisma.review.count({ where: { ...base, hasMedia: true } }),
   ]);
   if (!prod.product) throw new Response("Product not found", { status: 404 });
   const byStatus: Record<string, number> = { published: 0, pending: 0, hidden: 0 };
@@ -72,8 +73,8 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     shopName: prod.shop.name as string,
     byStatus,
     customerCount,
-    flaggedCount,
-    needsCount,
+    mediaCount,
+    commentCounts,
     list: {
       ...list,
       rows: list.rows.map((r) => {
@@ -597,7 +598,10 @@ function DateFilter({ from, to, onApply }: { from: string; to: string; onApply: 
 
 /* ───────────────────────── page ───────────────────────── */
 export default function ProductReviews() {
-  const { product, shopName, byStatus, customerCount, flaggedCount, needsCount, list } = useLoaderData<typeof loader>();
+  const { product, shopName, byStatus, customerCount, mediaCount, commentCounts, list } = useLoaderData<typeof loader>();
+  const flaggedCount = commentCounts.waiting;
+  const needsCount = commentCounts.needs;
+  const allCount = byStatus.published + byStatus.pending + byStatus.hidden;
   const [params] = useSearchParams();
   const navigate = useNavigate();
   const shopify = useAppBridge();
@@ -772,23 +776,22 @@ export default function ProductReviews() {
 
             <div className="rv-row">
               <button type="button" className={`rv-chip${flag("media") ? " on" : ""}`} onClick={() => go({ media: flag("media") ? null : "1" })}>
-                🖼 With photos
+                🖼 With photos <span className="n">{mediaCount}</span>
               </button>
               <button type="button" className={`rv-chip${flag("customer") ? " on" : ""}`} onClick={() => go({ customer: flag("customer") ? null : "1" })}>
                 👤 Customer reviews <span className="n">{customerCount}</span>
               </button>
               <label className={`rv-chip rv-pick${commentsVal ? " on" : ""}`}>
-                💬 {commentsVal ? COMMENT_FILTERS[commentsVal as CommentFilter] : "Comments"} <span className="caret">▾</span>
+                💬 {commentsVal ? COMMENT_FILTERS[commentsVal as CommentFilter] : "Comments"}
+                <span className="n">{commentsVal ? commentCounts[commentsVal as CommentFilter] : commentCounts.with}</span>
+                <span className="caret">▾</span>
                 <select value={commentsVal} onChange={(e) => setComments(e.currentTarget.value)} aria-label="Comments filter">
-                  <option value="">Any comments</option>
+                  <option value="">Any comments ({allCount})</option>
                   {(Object.keys(COMMENT_FILTERS) as CommentFilter[]).map((k) => (
-                    <option key={k} value={k}>
-                      {COMMENT_FILTERS[k]}{k === "waiting" ? ` (${flaggedCount})` : k === "needs" ? ` (${needsCount})` : ""}
-                    </option>
+                    <option key={k} value={k}>{COMMENT_FILTERS[k]} ({commentCounts[k]})</option>
                   ))}
                 </select>
               </label>
-              <DateFilter from={params.get("from") || ""} to={params.get("to") || ""} onApply={(f, t) => go({ from: f || null, to: t || null })} />
               {(flaggedCount > 0 || needsCount > 0) && <span className="rv-sep" />}
               {flaggedCount > 0 && commentsVal !== "waiting" && (
                 <button type="button" className="rv-chip alert" onClick={() => setComments("waiting")} title="Comments with abusive words wait for your approval">
@@ -803,6 +806,8 @@ export default function ProductReviews() {
               {anyFilter && (
                 <button type="button" className="rv-clear" onClick={() => go(clearAll)}>Clear filters</button>
               )}
+              <span className="rv-sp" />
+              <DateFilter from={params.get("from") || ""} to={params.get("to") || ""} onApply={(f, t) => go({ from: f || null, to: t || null })} />
             </div>
 
             {count > 0 && (
