@@ -124,7 +124,7 @@ export async function listProducts(admin: Admin, q: string, after?: string | nul
 export async function loadProductWidgets(admin: Admin, productId: string) {
   const d = await gql(admin, `query($id: ID!) {
     shop { primaryDomain { url } }
-    product(id: $id) { id title handle status onlineStoreUrl onlineStorePreviewUrl
+    product(id: $id) { id title handle status onlineStoreUrl onlineStorePreviewUrl templateSuffix
       featuredMedia { preview { image { url } } }
       media(first: 12) { nodes { ... on MediaImage { image { url } } } }
       options { name values }
@@ -157,6 +157,7 @@ export async function loadProductWidgets(admin: Admin, productId: string) {
       handle: p.handle as string,
       status: p.status as string,
       url: (p.onlineStoreUrl as string) || "",
+      templateSuffix: (p.templateSuffix as string) || "",
       domain: String(d.shop?.primaryDomain?.url || "").replace(/\/$/, ""),
       image: p.featuredMedia?.preview?.image?.url || "",
       images: (p.media?.nodes || []).map((m: any) => m?.image?.url).filter(Boolean) as string[],

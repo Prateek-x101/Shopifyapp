@@ -14,6 +14,10 @@ import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import { loadProductWidgets, saveWidget } from "../lib/product-widgets.server";
 import { previewUrl } from "../lib/preview.server";
+import { loadPageSections, saveSections, themeImageFromUpload } from "../lib/theme-sections.server";
+import type { SectionChange } from "../lib/theme-sections.server";
+import { WIDGET_OF_SECTION } from "../lib/theme-sections.shared";
+import type { SectionData, SettingDef } from "../lib/theme-sections.shared";
 import { AFTER_END, FIT_CHOICES, ICONS, ON_TAP, TIMER_MODES } from "../lib/product-widgets.shared";
 import type { Offer, OfferCard, VideoItem } from "../lib/product-widgets.shared";
 
@@ -22,7 +26,10 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const data = await loadProductWidgets(admin, params.productId!);
   if (!data) throw new Response("Product not found", { status: 404 });
   const live = data.product.status === "ACTIVE" && !!data.product.url && !!data.product.domain;
-  return { ...data, previewSrc: live ? previewUrl(session.shop, data.product.domain, data.product.handle) : "" };
+  let page: Awaited<ReturnType<typeof loadPageSections>> | null = null;
+  let pageError = "";
+  try { page = await loadPageSections(admin, data.product.templateSuffix || null); } catch (e: any) { pageError = e?.message || "Could not read the theme"; }
+  return { ...data, page, pageError, previewSrc: live ? previewUrl(session.shop, data.product.domain, data.product.handle) : "" };
 };
 
 export const action = async ({ request, params }: ActionFunctionArgs) => {
@@ -35,6 +42,26 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
   for (const w of widgets) {
     try { await saveWidget(admin, params.productId!, w, fd); saved.push(w); }
     catch (e: any) { errors.push(`${w}: ${e?.message || "could not save"}`); }
+  }
+  // theme section settings (all products on the template)
+  const secRaw = fd.get("sections");
+  if (secRaw) {
+    try {
+      const sec = JSON.parse(String(secRaw)) as { templateFile: string; also: string[]; changes: SectionChange[] };
+      // pictures for image settings: "themeimg:<sectionId>:<blockKey or ->:<settingId>"
+      for (const [k, v] of fd.entries()) {
+        if (!k.startsWith("themeimg:") || typeof v === "string" || !v.size) continue;
+        const [, id, g2, bk, sid] = k.split(":");
+        const secId = `${id}:${g2}`;
+        const value = await themeImageFromUpload(admin, v);
+        let c = sec.changes.find((x) => x.id === secId);
+        if (!c) { c = { id: secId }; sec.changes.push(c); }
+        if (bk && bk !== "-") { c.blocks = c.blocks || {}; c.blocks[bk] = { ...(c.blocks[bk] || {}), [sid]: value }; }
+        else c.settings = { ...(c.settings || {}), [sid]: value };
+      }
+      const n = await saveSections(admin, sec.templateFile, sec.changes, sec.also || []);
+      if (n) saved.push("sections");
+    } catch (e: any) { errors.push(`theme: ${e?.message || "could not save"}`); }
   }
   return {
     ok: errors.length === 0,
@@ -457,17 +484,188 @@ function ReviewsPanel({ d }: { d: Data }) {
   );
 }
 
+/* ───────────────────────── theme section settings (like Shopify's editor) ───────────────────────── */
+type SecDraft = { disabled?: boolean; settings: Record<string, unknown>; blocks: Record<string, Record<string, unknown>>; images: Record<string, File> };
+const emptySec = (): SecDraft => ({ settings: {}, blocks: {}, images: {} });
+
+const SEC_CSS = `
+.te-tabs { display: flex; gap: 4px; padding: 8px 16px 0; border-bottom: 1px solid #ebebeb; }
+.te-tabs button { border: 0; background: none; padding: 8px 10px; font: inherit; font-weight: 600; color: #616161; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; }
+.te-tabs button.on { color: #303030; border-bottom-color: #303030; }
+.te-eye { margin-left: auto; border: 0; background: none; padding: 2px; border-radius: 6px; cursor: pointer; color: #8a8a8a; display: grid; place-items: center; }
+.te-eye:hover { background: #ebebeb; color: #303030; }
+.te-i.hidden-sec > span:not(.te-i-meta) { text-decoration: line-through; color: #8a8a8a; }
+.te-range { display: grid; grid-template-columns: 1fr 76px; gap: 10px; align-items: center; }
+.te-range input[type=range] { width: 100%; accent-color: #303030; }
+.te-range-l { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 4px; }
+.te-hdr { margin: 16px 0 2px; padding-top: 12px; border-top: 1px solid #ebebeb; font-size: 12px; font-weight: 650; color: #303030; text-transform: uppercase; letter-spacing: .02em; }
+.te-hdr:first-child { margin-top: 0; padding-top: 0; border-top: 0; }
+.te-block { border: 1px solid #e3e3e3; border-radius: 10px; margin-top: 10px; }
+.te-block > button { width: 100%; display: flex; align-items: center; gap: 8px; border: 0; background: none; padding: 9px 10px; font: inherit; font-weight: 600; cursor: pointer; text-align: left; }
+.te-block > div { padding: 4px 10px 12px; border-top: 1px solid #f1f1f1; }
+`;
+
+function imageUrl(v: unknown, domain: string) {
+  const s = String(v || "");
+  const m = s.match(/^shopify:\/\/shop_images\/(.+)$/);
+  if (m) return `${domain}/cdn/shop/files/${encodeURIComponent(m[1])}?width=400`;
+  return /^https?:/.test(s) ? s : "";
+}
+
+function SettingField({ def, value, onChange, schemes, domain, pending, onImage }: {
+  def: SettingDef; value: unknown; onChange: (v: unknown) => void; schemes: { value: string; label: string }[];
+  domain: string; pending?: File; onImage: (f: File | null) => void;
+}) {
+  const label = def.label || def.id;
+  const details = def.info || undefined;
+  const v = value ?? def.default ?? "";
+  switch (def.type) {
+    case "header": return <div className="te-hdr">{def.content || def.label}</div>;
+    case "paragraph": return <span className="te-note">{def.content || def.label}</span>;
+    case "checkbox": return <s-checkbox label={label} details={details} checked={!!(value ?? def.default)} onChange={(e: any) => onChange(!!e.currentTarget.checked)} />;
+    case "range": {
+      const n = Number(v);
+      return (
+        <div>
+          <div className="te-range-l"><span>{label}</span><span className="te-note">{def.unit}</span></div>
+          <div className="te-range">
+            <input type="range" min={def.min} max={def.max} step={def.step || 1} value={Number.isFinite(n) ? n : 0} onChange={(e) => onChange(Number(e.currentTarget.value))} aria-label={label} />
+            <s-number-field label={label} labelAccessibilityVisibility="exclusive" value={String(Number.isFinite(n) ? n : "")} min={def.min} max={def.max} step={def.step || 1} suffix={def.unit || undefined} onChange={(e: any) => onChange(Number(e.currentTarget.value))} />
+          </div>
+          {details && <span className="te-note">{details}</span>}
+        </div>
+      );
+    }
+    case "number": return <s-number-field label={label} details={details} value={String(v)} onInput={(e: any) => onChange(e.currentTarget.value === "" ? null : Number(e.currentTarget.value))} />;
+    case "select":
+      return (
+        <s-select label={label} details={details} value={String(v)} onChange={(e: any) => onChange(e.currentTarget.value)}>
+          {(def.options || []).map((o) => <s-option key={o.value} value={o.value}>{o.label}</s-option>)}
+        </s-select>
+      );
+    case "radio":
+      return (
+        <s-choice-list label={label} details={details} values={[String(v)]} onChange={(e: any) => onChange(e.currentTarget.values?.[0])}>
+          {(def.options || []).map((o) => <s-choice key={o.value} value={o.value}>{o.label}</s-choice>)}
+        </s-choice-list>
+      );
+    case "color": case "color_background":
+      return <s-color-field label={label} details={details} value={String(v || "")} onChange={(e: any) => onChange(e.currentTarget.value)} />;
+    case "color_scheme":
+      return (
+        <s-select label={label} details={details} value={String(v)} onChange={(e: any) => onChange(e.currentTarget.value)}>
+          {schemes.map((o) => <s-option key={o.value} value={o.value}>{o.label} ({o.value})</s-option>)}
+        </s-select>
+      );
+    case "textarea": case "richtext": case "html": case "liquid":
+      return <s-text-area label={label} details={details} rows={3} value={String(v)} onInput={(e: any) => onChange(e.currentTarget.value)} />;
+    case "url":
+      return <s-url-field label={label} details={details} value={String(v)} onInput={(e: any) => onChange(e.currentTarget.value)} />;
+    case "image_picker": {
+      const src = pending ? URL.createObjectURL(pending) : imageUrl(v, domain);
+      return (
+        <div>
+          <div className="te-sec-t">{label}</div>
+          {src && <img className="te-thumb" src={src} alt="" />}
+          <s-drop-zone label={src ? "Replace" : "Upload"} accept="image/*" onChange={(e: any) => onImage(e.currentTarget.files?.[0] || null)} />
+          {(src) && <s-button variant="tertiary" tone="critical" onClick={() => { onImage(null); onChange(""); }}>Remove</s-button>}
+          {details && <span className="te-note">{details}</span>}
+        </div>
+      );
+    }
+    default:
+      return <s-text-field label={label} details={details || (/(link_list|product|collection|page|blog|article)/.test(def.type) ? "Handle" : undefined)} placeholder={def.placeholder || undefined} value={String(v ?? "")} onInput={(e: any) => onChange(e.currentTarget.value)} />;
+  }
+}
+
+function SectionForm({ sec, draft, set, schemes, domain, templateFile, others, also, setAlso }: {
+  sec: SectionData; draft: SecDraft; set: (d: SecDraft) => void; schemes: { value: string; label: string }[]; domain: string;
+  templateFile: string; others: string[]; also: boolean; setAlso: (v: boolean) => void;
+}) {
+  const [openBlock, setOpenBlock] = useState<string | null>(null);
+  const disabled = draft.disabled ?? sec.disabled;
+  const shownTemplates = sec.group === "header" ? "every page (header)" : `every product using ${templateFile.replace(/^templates\//, "")}${also && others.length ? ` and ${others.map((o) => o.replace(/^templates\//, "")).join(", ")}` : ""}`;
+  const val = (id: string) => (id in draft.settings ? draft.settings[id] : sec.values[id]);
+  const bval = (bk: string, id: string, vals: Record<string, unknown>) => (draft.blocks[bk] && id in draft.blocks[bk] ? draft.blocks[bk][id] : vals[id]);
+  return (
+    <>
+      <Sec>
+        <s-banner tone="info">Theme setting — applies to {shownTemplates}.</s-banner>
+        {sec.group === "template" && others.length > 0 && (
+          <s-checkbox label="Also change the other product templates" details={others.map((o) => o.replace(/^templates\//, "")).join(", ")} checked={also} onChange={(e: any) => setAlso(!!e.currentTarget.checked)} />
+        )}
+        <s-switch label="Show this section" checked={!disabled} onChange={(e: any) => set({ ...draft, disabled: !e.currentTarget.checked })} />
+      </Sec>
+      <div className="te-sec">
+        <s-stack gap="base">
+          {sec.settings.length === 0 && <span className="te-note">This section has no settings.</span>}
+          {sec.settings.map((def, i) => (
+            <SettingField
+              key={def.id || `${def.type}${i}`}
+              def={def}
+              value={def.id ? val(def.id) : undefined}
+              schemes={schemes}
+              domain={domain}
+              pending={draft.images[`-:${def.id}`]}
+              onChange={(v) => set({ ...draft, settings: { ...draft.settings, [def.id]: v } })}
+              onImage={(f) => { const images = { ...draft.images }; if (f) images[`-:${def.id}`] = f; else delete images[`-:${def.id}`]; set({ ...draft, images }); }}
+            />
+          ))}
+        </s-stack>
+      </div>
+      {sec.blocks.length > 0 && (
+        <div className="te-sec">
+          <div className="te-sec-t">Blocks</div>
+          {sec.blocks.map((b) => (
+            <div key={b.key} className="te-block">
+              <button type="button" onClick={() => setOpenBlock(openBlock === b.key ? null : b.key)}>
+                <s-icon type="layout-block" />{b.name}{b.disabled && <s-badge>Hidden</s-badge>}
+              </button>
+              {openBlock === b.key && (
+                <div>
+                  <s-stack gap="base">
+                    {b.settings.length === 0 && <span className="te-note">No settings.</span>}
+                    {b.settings.map((def, i) => (
+                      <SettingField
+                        key={def.id || `${def.type}${i}`}
+                        def={def}
+                        value={def.id ? bval(b.key, def.id, b.values) : undefined}
+                        schemes={schemes}
+                        domain={domain}
+                        pending={draft.images[`${b.key}:${def.id}`]}
+                        onChange={(v) => set({ ...draft, blocks: { ...draft.blocks, [b.key]: { ...(draft.blocks[b.key] || {}), [def.id]: v } } })}
+                        onImage={(f) => { const images = { ...draft.images }; if (f) images[`${b.key}:${def.id}`] = f; else delete images[`${b.key}:${def.id}`]; set({ ...draft, images }); }}
+                      />
+                    ))}
+                  </s-stack>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </>
+  );
+}
+
 /* ───────────────────────── page ───────────────────────── */
+const WIDGET_META: Record<WidgetKey, { label: string; icon: string; about: string }> = Object.fromEntries(ALL.map((w) => [w.key, { label: w.label, icon: w.icon, about: w.about }])) as any;
+
 export default function ProductEditor() {
   const d = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const shopify = useAppBridge();
   const navigate = useNavigate();
   const revalidator = useRevalidator();
-  const [sel, setSel] = useState<WidgetKey>("offer");
+  const sections: SectionData[] = d.page?.sections || [];
+  const firstSel = sections.find((s) => s.type === "engine-offer-bar")?.id || sections[0]?.id || "";
+  const [sel, setSel] = useState<string>(firstSel);
+  const [tab, setTab] = useState<"product" | "section">("product");
   const base = useMemo(() => initDrafts(d), [d]);
   const [drafts, setDrafts] = useState<Drafts>(base);
   const [dirty, setDirty] = useState<Partial<Record<WidgetKey, boolean>>>({});
+  const [secDrafts, setSecDrafts] = useState<Record<string, SecDraft>>({});
+  const [also, setAlso] = useState(true);
   const [mobile, setMobile] = useState(true);
   const [loading, setLoading] = useState(!!d.previewSrc);
   const [present, setPresent] = useState<string[] | null>(null);
@@ -475,13 +673,18 @@ export default function ProductEditor() {
   const frame = useRef<HTMLIFrameElement>(null);
   const scrollY = useRef(0);
   const restoreY = useRef<number | null>(null);
-  const savedKeys = useRef<WidgetKey[]>([]);
+  const savedKeys = useRef<string[]>([]);
   const busy = fetcher.state !== "idle";
-  const anyDirty = SAVABLE.some((k) => dirty[k]);
+  const secDirty = Object.keys(secDrafts).length > 0;
+  const anyDirty = SAVABLE.some((k) => dirty[k]) || secDirty;
+
+  const section = sections.find((s) => s.id === sel) || null;
+  const widget: WidgetKey | null = section ? WIDGET_OF_SECTION[section.type] || null : null;
+  const effTab = widget ? tab : "section";
 
   const post = useCallback((m: any) => { try { frame.current?.contentWindow?.postMessage(m, "*"); } catch { /* frame gone */ } }, []);
+  const labels = useMemo(() => Object.fromEntries(sections.map((s) => [s.id, s.name])), [sections]);
 
-  /* messages from the preview */
   useEffect(() => {
     const on = (e: MessageEvent) => {
       if (!frame.current || e.source !== frame.current.contentWindow) return;
@@ -489,19 +692,20 @@ export default function ProductEditor() {
       if (m.vw === "ready") {
         setLoading(false);
         setPresent(m.present || []);
+        post({ vw: "labels", map: labels });
         if (restoreY.current != null) { post({ vw: "scrollTo", y: restoreY.current }); restoreY.current = null; }
         post({ vw: "select", key: sel, scroll: false });
       }
-      if (m.vw === "select" && ALL.some((w) => w.key === m.key)) setSel(m.key);
+      if (m.vw === "select" && sections.some((s) => s.id === m.key)) setSel(m.key);
       if (m.vw === "scroll") scrollY.current = m.y || 0;
     };
     window.addEventListener("message", on);
     return () => window.removeEventListener("message", on);
-  }, [post, sel]);
+  }, [post, sel, labels, sections]);
 
   useEffect(() => { post({ vw: "select", key: sel }); }, [sel, post]);
 
-  /* unsaved changes → preview right away (offer bar, badges, WhatsApp lines) */
+  /* unsaved product changes → preview right away (offer bar, badges, WhatsApp lines) */
   useEffect(() => {
     const t = setTimeout(() => {
       const o = drafts.offer;
@@ -519,12 +723,11 @@ export default function ProductEditor() {
     return () => clearTimeout(t);
   }, [drafts, dirty, d.offers, post]);
 
-  /* after Save: fresh data, and the preview reloads to show the real saved page at the same place */
   useEffect(() => {
     const r: any = fetcher.data;
     if (!r?.message) return;
     shopify.toast.show(r.message, { isError: r.ok === false });
-    savedKeys.current = (r.saved || []) as WidgetKey[];
+    savedKeys.current = r.saved || [];
     if (r.saved?.length) {
       revalidator.revalidate();
       restoreY.current = scrollY.current;
@@ -537,15 +740,17 @@ export default function ProductEditor() {
     const keys = savedKeys.current;
     if (!keys.length) return;
     savedKeys.current = [];
-    setDrafts((cur) => { const n: any = { ...cur }; keys.forEach((k) => (n[k] = (base as any)[k])); return n; });
-    setDirty((cur) => { const n = { ...cur }; keys.forEach((k) => (n[k] = false)); return n; });
+    setDrafts((cur) => { const n: any = { ...cur }; keys.forEach((k) => { if (k in n) n[k] = (base as any)[k]; }); return n; });
+    setDirty((cur) => { const n: any = { ...cur }; keys.forEach((k) => (n[k] = false)); return n; });
+    if (keys.includes("sections")) setSecDrafts({});
   }, [base]);
 
   const setW = <K extends keyof Drafts>(k: K) => (v: Drafts[K]) => { setDrafts((cur) => ({ ...cur, [k]: v })); setDirty((cur) => ({ ...cur, [k]: true })); };
+  const setSec = (id: string) => (v: SecDraft) => setSecDrafts((cur) => ({ ...cur, [id]: v }));
 
   const save = () => {
     const keys = SAVABLE.filter((k) => dirty[k]);
-    if (!keys.length) return;
+    if (!keys.length && !secDirty) return;
     const fd = new FormData();
     fd.append("widgets", JSON.stringify(keys));
     for (const k of keys) {
@@ -569,26 +774,40 @@ export default function ProductEditor() {
       }
       if (k === "whatsapp") fd.append("data_whatsapp", JSON.stringify({ rows: drafts.whatsapp.rows }));
     }
+    if (secDirty && d.page) {
+      const changes: SectionChange[] = Object.entries(secDrafts).map(([id, sd]) => ({
+        id,
+        ...(sd.disabled !== undefined ? { disabled: sd.disabled } : {}),
+        ...(Object.keys(sd.settings).length ? { settings: sd.settings } : {}),
+        ...(Object.keys(sd.blocks).length ? { blocks: sd.blocks } : {}),
+      }));
+      fd.append("sections", JSON.stringify({ templateFile: d.page.templateFile, also: also ? d.page.otherTemplates : [], changes }));
+      Object.entries(secDrafts).forEach(([id, sd]) => Object.entries(sd.images).forEach(([k, f]) => fd.append(`themeimg:${id}:${k}`, f)));
+    }
     fetcher.submit(fd, { method: "post", encType: "multipart/form-data" });
   };
   const discard = () => {
     setDrafts(base);
     setDirty({});
+    setSecDrafts({});
     restoreY.current = scrollY.current;
     setLoading(true);
-    setReloadKey((k) => k + 1); // throw away the unsaved preview changes too
+    setReloadKey((k) => k + 1);
   };
 
   const isSet = (k: WidgetKey) =>
     k === "offer" ? !!d.offerId : k === "specialOffers" ? d.cardIds.length > 0 : k === "badges" ? !!d.badges : k === "sizeGuide" ? !!(d.sizeChart.id || d.sizeFit)
       : k === "videos" ? d.videos.length > 0 : k === "whatsapp" ? !!d.whatsapp : d.reviews.count > 0;
-  const W = ALL.find((w) => w.key === sel)!;
   const src = d.previewSrc ? `${d.previewSrc}&r=${reloadKey}` : "";
-  const onPage = (k: WidgetKey) => !present || present.includes(k);
+  const isHidden = (s: SectionData) => secDrafts[s.id]?.disabled ?? s.disabled;
+  const rowDirty = (s: SectionData) => !!secDrafts[s.id] || (!!WIDGET_OF_SECTION[s.type] && !!dirty[WIDGET_OF_SECTION[s.type]]);
+  const rowSet = (s: SectionData) => !!WIDGET_OF_SECTION[s.type] && isSet(WIDGET_OF_SECTION[s.type]);
+  const toggleHidden = (s: SectionData) => { const cur = secDrafts[s.id] || emptySec(); setSecDrafts((all) => ({ ...all, [s.id]: { ...cur, disabled: !isHidden(s) } })); };
+  const groups: [string, SectionData[]][] = [["Header", sections.filter((s) => s.group === "header")], ["Template", sections.filter((s) => s.group === "template")]];
 
   return (
     <>
-      <style>{CSS}</style>
+      <style>{CSS + SEC_CSS}</style>
       <SaveBar id="product-editor-save" open={anyDirty}>
         <button variant="primary" onClick={save} {...(busy ? { loading: "" } : {})}>Save</button>
         <button onClick={discard} {...(busy ? { disabled: true } : {})}>Discard</button>
@@ -600,6 +819,7 @@ export default function ProductEditor() {
             {d.product.image && <img src={img(d.product.image, 80)} alt="" />}
             <span className="te-name">{d.product.title}</span>
             {d.product.status !== "ACTIVE" && <s-badge>{d.product.status === "DRAFT" ? "Draft" : "Archived"}</s-badge>}
+            {d.page && <s-badge>{d.page.templateFile.replace(/^templates\//, "")}</s-badge>}
           </div>
           <div className="te-dev" role="group" aria-label="Preview size">
             <button type="button" className={mobile ? "on" : ""} onClick={() => setMobile(true)}><s-icon type="mobile" />Mobile</button>
@@ -613,19 +833,28 @@ export default function ProductEditor() {
 
         <div className="te-body">
           <div className="te-side te-left">
-            {GROUPS.map((g) => (
-              <div key={g.title}>
-                <div className="te-g">{g.title}</div>
-                {g.items.map((w) => (
-                  <button key={w.key} type="button" className={`te-i${sel === w.key ? " on" : ""}${onPage(w.key) ? "" : " missing"}`} onClick={() => setSel(w.key)}>
-                    <s-icon type={w.icon as any} />
-                    <span>{w.label}</span>
-                    <span className="te-i-meta">
-                      {!onPage(w.key) && <span>Off in theme</span>}
-                      <span className={`te-dot${dirty[w.key] ? " dirty" : isSet(w.key) ? " set" : ""}`} title={dirty[w.key] ? "Unsaved changes" : isSet(w.key) ? "Set on this product" : "Not set"} />
-                    </span>
-                  </button>
-                ))}
+            {d.pageError && <s-banner tone="warning">{d.pageError}</s-banner>}
+            {groups.map(([title, list]) => list.length > 0 && (
+              <div key={title}>
+                <div className="te-g">{title}</div>
+                {list.map((s) => {
+                  const w = WIDGET_OF_SECTION[s.type];
+                  const inPage = !present || present.includes(s.id);
+                  return (
+                    <div key={s.id} style={{ display: "flex", alignItems: "center" }}>
+                      <button type="button" className={`te-i${sel === s.id ? " on" : ""}${isHidden(s) ? " hidden-sec" : ""}`} onClick={() => setSel(s.id)} title={isHidden(s) ? "Hidden on the store" : inPage ? "" : "Not shown on this page"}>
+                        <s-icon type={(w ? WIDGET_META[w].icon : "layout-block") as any} />
+                        <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{s.name}</span>
+                        <span className="te-i-meta">
+                          <span className={`te-dot${rowDirty(s) ? " dirty" : rowSet(s) ? " set" : ""}`} />
+                        </span>
+                      </button>
+                      <button type="button" className="te-eye" onClick={() => toggleHidden(s)} aria-label={isHidden(s) ? "Show section" : "Hide section"} title={isHidden(s) ? "Show section" : "Hide section"}>
+                        <s-icon type={isHidden(s) ? "hide" : "view"} />
+                      </button>
+                    </div>
+                  );
+                })}
               </div>
             ))}
           </div>
@@ -641,7 +870,7 @@ export default function ProductEditor() {
                 <div className="te-nolive">
                   <s-stack gap="base" alignItems="center">
                     <s-heading>No live preview</s-heading>
-                    <s-paragraph>This product isn’t on the online store yet (draft, archived or not published). You can still edit its widgets; they show once it’s published.</s-paragraph>
+                    <s-paragraph>This product isn’t on the online store yet (draft, archived or not published). You can still edit it; changes show once it’s published.</s-paragraph>
                   </s-stack>
                 </div>
               )}
@@ -650,17 +879,42 @@ export default function ProductEditor() {
 
           <div className="te-side te-right">
             <div className="te-head">
-              <h2><s-icon type={W.icon as any} />{W.label}{dirty[sel] && <s-badge tone="warning">Unsaved</s-badge>}</h2>
-              <p>{W.about}</p>
+              <h2>
+                <s-icon type={(widget ? WIDGET_META[widget].icon : "layout-block") as any} />
+                {section?.name || "Section"}
+                {section && rowDirty(section) && <s-badge tone="warning">Unsaved</s-badge>}
+              </h2>
+              <p>{widget ? WIDGET_META[widget].about : "Theme section on the product page."}</p>
             </div>
+            {widget && (
+              <div className="te-tabs" role="tablist">
+                <button type="button" className={effTab === "product" ? "on" : ""} onClick={() => setTab("product")}>This product</button>
+                <button type="button" className={effTab === "section" ? "on" : ""} onClick={() => setTab("section")}>Section settings</button>
+              </div>
+            )}
             <div className="te-form">
-              {sel === "offer" && <OfferForm d={d} v={drafts.offer} set={setW("offer")} />}
-              {sel === "specialOffers" && <CardsForm d={d} v={drafts.specialOffers} set={setW("specialOffers")} present={onPage("specialOffers")} />}
-              {sel === "badges" && <BadgesForm d={d} v={drafts.badges} set={setW("badges")} />}
-              {sel === "sizeGuide" && <SizeForm v={drafts.sizeGuide} set={setW("sizeGuide")} />}
-              {sel === "videos" && <VideosForm v={drafts.videos} set={setW("videos")} />}
-              {sel === "whatsapp" && <WhatsAppForm v={drafts.whatsapp} set={setW("whatsapp")} />}
-              {sel === "reviews" && <ReviewsPanel d={d} />}
+              {effTab === "product" && widget === "offer" && <OfferForm d={d} v={drafts.offer} set={setW("offer")} />}
+              {effTab === "product" && widget === "specialOffers" && <CardsForm d={d} v={drafts.specialOffers} set={setW("specialOffers")} present={!section?.disabled} />}
+              {effTab === "product" && widget === "badges" && <BadgesForm d={d} v={drafts.badges} set={setW("badges")} />}
+              {effTab === "product" && widget === "sizeGuide" && <SizeForm v={drafts.sizeGuide} set={setW("sizeGuide")} />}
+              {effTab === "product" && widget === "videos" && <VideosForm v={drafts.videos} set={setW("videos")} />}
+              {effTab === "product" && widget === "whatsapp" && <WhatsAppForm v={drafts.whatsapp} set={setW("whatsapp")} />}
+              {effTab === "product" && widget === "reviews" && <ReviewsPanel d={d} />}
+              {effTab === "section" && section && d.page && (
+                <SectionForm
+                  key={section.id}
+                  sec={section}
+                  draft={secDrafts[section.id] || emptySec()}
+                  set={setSec(section.id)}
+                  schemes={d.page.colorSchemes}
+                  domain={d.product.domain}
+                  templateFile={d.page.templateFile}
+                  others={d.page.otherTemplates}
+                  also={also}
+                  setAlso={setAlso}
+                />
+              )}
+              {!section && <span className="te-note">Pick a section on the left or click one in the preview.</span>}
             </div>
           </div>
         </div>

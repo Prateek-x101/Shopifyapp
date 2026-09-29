@@ -9,24 +9,34 @@
  */
 export const BRIDGE_JS = String.raw`(function () {
   if (window.__vwBridge) return; window.__vwBridge = true;
-  var W = [
-    ["offer", "Offer bar", '[id$="__engine-offer-bar"]'],
-    ["badges", "Swatch badges", '[id$="__engine-swatches"]'],
-    ["sizeGuide", "Size guide", '#st-trigger, [id$="__engine-size-table"] .sp-size-root'],
-    ["whatsapp", "WhatsApp button", '#sp-whatsapp-btn'],
-    ["specialOffers", "Special Offers", '[id$="__engine-special-offers"]'],
-    ["videos", "Floating videos", '[id$="__engine-video-float"] .vwv, [id$="__engine-video-float"] > *:not(script):not(style)'],
-    ["reviews", "Reviews", '[id$="__engine-review-widget"], [id$="__engine-review-banner"], .sp-box .pi-vstar']
-  ];
-  function el(key) { for (var i = 0; i < W.length; i++) if (W[i][0] === key) { var n = document.querySelector(W[i][2]); return visible(n) ? n : null; } return null; }
-  function label(key) { for (var i = 0; i < W.length; i++) if (W[i][0] === key) return W[i][1]; return key; }
-  function visible(n) { if (!n) return false; var r = n.getBoundingClientRect(); return r.width > 0 && r.height > 0; }
-  function keyOf(target) {
-    for (var i = 0; i < W.length; i++) {
-      var list = document.querySelectorAll(W[i][2]);
-      for (var j = 0; j < list.length; j++) if (list[j].contains(target)) return W[i][0];
+  /* every theme section on the page can be picked: id "shopify-section-<group>__<key>" → "header:<key>" / "template:<key>" */
+  var labels = {};
+  function idOf(sec) {
+    var m = /^shopify-section-(.+?)__(.+)$/.exec(sec.id || "");
+    if (!m) return null;
+    return (/^template--/.test(m[1]) ? "template:" : "header:") + m[2];
+  }
+  function el(id) {
+    if (!id) return null;
+    var key = id.slice(id.indexOf(":") + 1), tpl = id.indexOf("template:") === 0;
+    var list = document.querySelectorAll('[id$="__' + key + '"].shopify-section, .shopify-section[id$="__' + key + '"]');
+    for (var i = 0; i < list.length; i++) {
+      if (/^shopify-section-template--/.test(list[i].id) === tpl) return target(list[i]);
     }
     return null;
+  }
+  /* the visible part of a section (fixed widgets like the floating video live inside a zero-height section) */
+  function target(sec) {
+    if (visible(sec)) return sec;
+    var kids = sec.querySelectorAll("*");
+    for (var i = 0; i < kids.length; i++) { var r = kids[i].getBoundingClientRect(); if (r.width > 20 && r.height > 20) return kids[i]; }
+    return null;
+  }
+  function label(id) { return labels[id] || (id || "").replace(/^.*?:/, "").replace(/[-_]/g, " "); }
+  function visible(n) { if (!n) return false; var r = n.getBoundingClientRect(); return r.width > 0 && r.height > 0; }
+  function keyOf(t) {
+    var sec = t && t.closest ? t.closest(".shopify-section") : null;
+    return sec ? idOf(sec) : null;
   }
   var post = function (m) { try { window.parent.postMessage(m, "*"); } catch (e) {} };
 
@@ -121,16 +131,13 @@ export const BRIDGE_JS = String.raw`(function () {
       }
     }
     if (m.vw === "draft") applyDraft(m.key, m.data);
+    if (m.vw === "labels") labels = m.map || {};
     if (m.vw === "scrollTo") window.scrollTo(0, m.y || 0);
   });
 
   function ready() {
-    // on the page = its theme section is there (even if this product has nothing to show in it yet)
-    var SECTION = { offer: "offer-bar", badges: "swatches", sizeGuide: "size-table", whatsapp: "buy-whatsapp-pay",
-      specialOffers: "special-offers", videos: "video-float", reviews: "review-widget" };
-    var present = W.filter(function (w) {
-      return !!document.querySelector(w[2]) || !!document.querySelector('[id$="__engine-' + SECTION[w[0]] + '"]');
-    }).map(function (w) { return w[0]; });
+    var present = [];
+    document.querySelectorAll(".shopify-section").forEach(function (sec) { var id = idOf(sec); if (id) present.push(id); });
     post({ vw: "ready", present: present, height: document.documentElement.scrollHeight });
   }
   if (document.readyState === "complete") setTimeout(ready, 50); else window.addEventListener("load", function () { setTimeout(ready, 50); });
