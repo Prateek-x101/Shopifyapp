@@ -515,6 +515,30 @@ export async function addComment(
   return node;
 }
 
+/**
+ * The widget shows a new comment at once with a temporary id ("cmt_<ms>") and does not learn the saved id.
+ * A reply to it arrives with that temporary id: find the same shopper's comment saved around that time.
+ * Returns the real id, or null (→ posted as a new top-level comment) when nothing matches.
+ */
+export async function resolveClientCommentId(reviewId: string, parentId: string, customerId: string): Promise<string | null> {
+  const cur = await prisma.review.findUnique({ where: { id: reviewId }, select: { replies: true } });
+  if (!cur) return parentId;
+  const tree = normalizeComments(JSON.parse(cur.replies));
+  if (findNode(tree, parentId)) return parentId;
+  const m = /^cmt_(\d{10,})$/.exec(parentId);
+  if (!m) return null;
+  const at = Number(m[1]);
+  let best: { id: string; gap: number } | null = null;
+  const walk = (list: ReviewComment[]) =>
+    list.forEach((c) => {
+      const gap = Math.abs(Date.parse(c.date) - at);
+      if (c.customerId === customerId && gap < 5 * 60 * 1000 && (!best || gap < best.gap)) best = { id: c.id, gap };
+      walk(c.replies || []);
+    });
+  walk(tree);
+  return best ? (best as { id: string }).id : null;
+}
+
 /** Edit a comment/reply from the admin: text, name, picture, or hide/show it. */
 export async function updateComment(
   admin: Admin,

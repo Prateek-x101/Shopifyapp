@@ -6,17 +6,32 @@ import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import { ensureSettingsDefinition, getSettings, saveSettings } from "../lib/settings.server";
 import { getModeration, saveModeration } from "../lib/moderation.server";
+import { repairWidget, widgetStatus } from "../lib/theme-repair.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
   await ensureSettingsDefinition(admin);
-  const [s, mod] = await Promise.all([getSettings(admin), getModeration(admin)]);
-  return { google_login: s.google_login, google_client_id: s.google_client_id, shop: session.shop, mod };
+  const [s, mod, widget] = await Promise.all([
+    getSettings(admin),
+    getModeration(admin),
+    widgetStatus(admin).catch((e: any) => ({ theme: "", found: false, missing: [] as string[], error: String(e?.message || e) })),
+  ]);
+  return { google_login: s.google_login, google_client_id: s.google_client_id, shop: session.shop, mod, widget };
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
   const fd = await request.formData();
+  if (fd.get("intent") === "repair-widget") {
+    try {
+      const r = await repairWidget(admin);
+      if (!r.done.length && !r.failed.length) return { ok: true, message: "The widget is already up to date" };
+      if (r.failed.length) return { ok: false, message: `Could not apply: ${r.failed.join(", ")}` };
+      return { ok: true, message: `Widget repaired in "${r.theme}" (${r.done.length} fix${r.done.length === 1 ? "" : "es"})` };
+    } catch (e: any) {
+      return { ok: false, message: e?.message || "Could not update the theme" };
+    }
+  }
   if (fd.get("intent") === "moderation") {
     try {
       await saveModeration(admin, session.shop, {
@@ -46,7 +61,12 @@ export default function Settings() {
   const data = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const modFetcher = useFetcher<typeof action>();
+  const fixFetcher = useFetcher<typeof action>();
   const shopify = useAppBridge();
+  const w: any = data.widget;
+  useEffect(() => {
+    if (fixFetcher.data?.message) shopify.toast.show(fixFetcher.data.message, { isError: !fixFetcher.data.ok });
+  }, [fixFetcher.data, shopify]);
   const [on, setOn] = useState(data.google_login);
   const busy = fetcher.state !== "idle";
 
@@ -85,6 +105,35 @@ export default function Settings() {
           </s-stack>
         </s-section>
       </fetcher.Form>
+
+      <s-section heading="Storefront widget">
+        <s-stack gap="base">
+          {w.error ? (
+            <s-banner tone="warning">Could not read the theme: {w.error}</s-banner>
+          ) : !w.found ? (
+            <s-paragraph>The review widget file (assets/review-widget.js) is not in the published theme “{w.theme}”.</s-paragraph>
+          ) : w.missing.length ? (
+            <s-banner tone="critical" heading="The review widget in your live theme needs a fix">
+              <s-unordered-list>
+                {w.missing.map((m: string) => <s-list-item key={m}>{m}</s-list-item>)}
+              </s-unordered-list>
+            </s-banner>
+          ) : (
+            <s-paragraph>✓ The review widget in “{w.theme}” is up to date.</s-paragraph>
+          )}
+          <s-paragraph>
+            Repair changes only the broken parts of assets/review-widget.js in your published theme; everything else in the file stays as it is.
+          </s-paragraph>
+          <fixFetcher.Form method="post">
+            <input type="hidden" name="intent" value="repair-widget" />
+            <s-stack direction="inline" justifyContent="end">
+              <s-button type="submit" variant={w.missing?.length ? "primary" : "secondary"} {...(fixFetcher.state !== "idle" ? { loading: true } : {})}>
+                Repair widget
+              </s-button>
+            </s-stack>
+          </fixFetcher.Form>
+        </s-stack>
+      </s-section>
 
       <modFetcher.Form method="post">
         <input type="hidden" name="intent" value="moderation" />

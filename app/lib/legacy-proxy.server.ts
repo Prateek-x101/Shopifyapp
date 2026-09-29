@@ -14,6 +14,7 @@ import { getModeration, isAbusive } from "./moderation.server";
 import {
   addComment,
   createReview,
+  resolveClientCommentId,
   gql,
   legacyPage,
   getVotes,
@@ -192,10 +193,14 @@ export async function legacyPost(admin: Admin, shop: string, sp: URLSearchParams
     // abusive words → the comment waits for the admin (Engine → Comments) instead of going live
     const mod = await getModeration(admin, shop);
     const flagged = isAbusive(`${name} ${text}`, mod.extra_words);
+    const rid = reviewGid(body.reviewId);
+    let parentId = actionType === "submit_reply" ? String(body.commentId || "") : null;
+    // replying to a comment you posted a moment ago: the widget still knows it by its temporary id "cmt_<time>"
+    if (parentId) parentId = await resolveClientCommentId(rid, parentId, customerId);
     const node = await addComment(
-      admin, shop, reviewGid(body.reviewId),
+      admin, shop, rid,
       { name: name || "Customer", text, type: "customer", customerId, verified, id: body.clientId, status: flagged ? "pending" : "approved" },
-      actionType === "submit_reply" ? String(body.commentId || "") : null,
+      parentId,
     );
     return json({
       success: true,
