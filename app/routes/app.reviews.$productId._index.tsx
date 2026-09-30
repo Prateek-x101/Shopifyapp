@@ -20,7 +20,7 @@ import { COMMENT_FILTERS, countComments, normalizeComments } from "../lib/review
 import type { BulkItem, CommentFilter, ReviewComment } from "../lib/reviews.shared";
 import { ReviewHeader, Thread, initials, peopleOf } from "../components/review-thread";
 import { BulkUpload } from "../components/bulk-upload";
-import { getModeration, isAbusive } from "../lib/moderation.server";
+import { blockUser, getModeration, isAbusive, isBlocked } from "../lib/moderation.server";
 
 /** Filters come from the URL, so the loader and "select all matching" use exactly the same set. */
 function filtersFrom(sp: URLSearchParams, shop: string, productId: string): ReviewFilters {
@@ -100,6 +100,8 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
           thread,
           replies: countComments(thread),
           pendingComments: countPending(thread),
+          customerId: r.customerId || "",
+          blocked: isBlocked(mod, r.customerId || ""),
           abusive: isAbusive(`${r.author} ${r.title || ""} ${r.body} ${r.location || ""}`, mod.extra_words),
           needsReply: r.needsReply,
           createdAt: r.createdAt.toISOString(),
@@ -183,6 +185,16 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     const op = String(fd.get("op") || "");
     const ids = await selectedIds();
     if (!ids.length) return { ok: false, message: "Select reviews first" };
+    if (op === "block") {
+      const rows = await prisma.review.findMany({ where: { shop: session.shop, productId, id: { in: ids }, customerId: { not: null } }, select: { customerId: true, author: true } });
+      const seen = new Set<string>();
+      for (const r of rows) {
+        if (!r.customerId || seen.has(r.customerId)) continue;
+        seen.add(r.customerId);
+        await blockUser(admin, session.shop, { id: r.customerId, name: r.author, reason: "Blocked by you (review)" });
+      }
+      return { ok: seen.size > 0, message: seen.size ? `${seen.size} customer${seen.size === 1 ? "" : "s"} blocked` : "None of these reviews came from a customer account" };
+    }
     const own = await prisma.review.findMany({ where: { shop: session.shop, productId, id: { in: ids } }, select: { id: true } });
     const quiet = { skipSummary: true }; // the summary is recomputed once at the end
     const run = async (rid: string) => {
@@ -225,6 +237,12 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     const on = fd.get("banner") === "true";
     await patchReview(admin, session.shop, id, { banner: on });
     return { ok: true, message: on ? "Shown in the reviews banner" : "Removed from the reviews banner" };
+  }
+  if (intent === "block-reviewer") {
+    const r = await prisma.review.findUnique({ where: { id } });
+    if (!r?.customerId || r.shop !== session.shop) return { ok: false, message: "This review isn't linked to a customer account" };
+    await blockUser(admin, session.shop, { id: r.customerId, name: r.author, reason: "Blocked by you (review)" });
+    return { ok: true, message: `${r.author} is blocked — no more reviews, comments or replies` };
   }
   if (intent === "verify") {
     await patchReview(admin, session.shop, id, { verified: fd.get("verified") === "true" });
@@ -527,6 +545,12 @@ function ReviewView({
         <button type="button" className="rp-btn" onClick={onConversation}>💬 Conversation</button>
         <a className="rp-btn" href={editUrl(productId, r.id)}>✎ Edit</a>
         <span className="rv-sp" />
+        {r.customerId && !r.blocked && (
+          <button type="button" className="rp-btn danger" disabled={busy} onClick={() => { if (confirm(`Block ${r.author}? They won't be able to post reviews, comments or replies.`)) send({ intent: "block-reviewer" }); }}>
+            Block customer
+          </button>
+        )}
+        {r.blocked && <span className="rv-flag">Blocked</span>}
         <button type="button" className="rp-btn danger" disabled={busy} onClick={() => { if (confirm("Delete this review permanently?")) send({ intent: "delete" }); }}>
           Delete
         </button>
@@ -851,6 +875,7 @@ export default function ProductReviews() {
                 <s-button onClick={() => runBulk("verified")} {...bb("verified")}>Mark verified</s-button>
                 <s-button onClick={() => runBulk("banner")} {...bb("banner")}>Show in banner</s-button>
                 <s-button onClick={() => runBulk("unbanner")} {...bb("unbanner")}>Remove from banner</s-button>
+                <s-button tone="critical" onClick={() => { if (confirm("Block the customers who wrote these reviews? They won't be able to post reviews, comments or replies.")) runBulk("block"); }} {...bb("block")}>Block reviewers</s-button>
                 <s-button icon="pin" onClick={() => runBulk("pin")} {...bb("pin")}>Pin</s-button>
                 <s-button onClick={() => runBulk("unpin")} {...bb("unpin")}>Unpin</s-button>
                 <s-button icon="export" onClick={() => runExport(false)} {...(exportBusy ? { loading: true } : {})}>Export</s-button>
@@ -906,6 +931,7 @@ export default function ProductReviews() {
                       {r.featured && <s-badge tone="info" icon="pin">Pinned</s-badge>}
                       {r.banner && <s-badge tone="success">In banner</s-badge>}
                       {r.abusive && <s-badge tone="critical">⚑ Abusive words</s-badge>}
+                      {r.blocked && <s-badge tone="critical">Blocked customer</s-badge>}
                     </s-stack>
                     {r.title && <s-text type="strong">{r.title}</s-text>}
                     <p className="rv-body">{r.body}</p>

@@ -41,6 +41,7 @@ export type ReviewInput = {
   helpful?: number;
   featured?: boolean;
   banner?: boolean;                     // chosen for the "What our customers say" banner
+  customerId?: string | null;           // shopper who wrote it in the store (for blocking)
   createdAt?: string;
 };
 
@@ -98,6 +99,13 @@ export async function ensureDefinitions(admin: Admin) {
       metaobjectDefinitionUpdate(id: $id, definition: $d) { metaobjectDefinition { id } userErrors { message } } }`, {
       id: def.metaobjectDefinitionByType.id,
       d: { fieldDefinitions: [{ create: { key: "avatar", name: "Reviewer picture", type: "file_reference", validations: [{ name: "file_type_options", value: '["Image"]' }] } }] },
+    });
+  }
+  if (def.metaobjectDefinitionByType && !keys.has("customer_id")) {
+    await gql(admin, `mutation($id: ID!, $d: MetaobjectDefinitionUpdateInput!) {
+      metaobjectDefinitionUpdate(id: $id, definition: $d) { metaobjectDefinition { id } userErrors { message } } }`, {
+      id: def.metaobjectDefinitionByType.id,
+      d: { fieldDefinitions: [{ create: { key: "customer_id", name: "Customer ID", type: "single_line_text_field" } }] },
     });
   }
   if (def.metaobjectDefinitionByType && !keys.has("banner")) {
@@ -160,6 +168,7 @@ function toFields(r: ReviewInput) {
     { key: "created", value: r.createdAt || new Date().toISOString() },
     { key: "avatar", value: r.avatar?.id || "" },
     { key: "banner", value: String(!!r.banner) },
+    { key: "customer_id", value: r.customerId || "" },
   ];
   return f;
 }
@@ -204,6 +213,7 @@ function fromMetaobject(shop: string, m: any) {
     helpful: parseInt(val("helpful") || "0", 10),
     featured: val("featured") === "true",
     banner: val("banner") === "true",
+    customerId: val("customer_id") || null,
     hasMedia: imgs.length > 0,
     ...commentState(replies),
     createdAt: new Date(val("created") || m.updatedAt),
@@ -275,7 +285,7 @@ export async function patchReview(admin: Admin, shop: string, id: string, patch:
   const merged: ReviewInput = {
     productId: cur.productId, rating: cur.rating, title: cur.title, body: cur.body, author: cur.author,
     location: cur.location, status: cur.status, verified: cur.verified, source: cur.source, orderId: cur.orderId,
-    images: JSON.parse(cur.images), replies: JSON.parse(cur.replies), helpful: cur.helpful, featured: cur.featured, banner: cur.banner,
+    images: JSON.parse(cur.images), replies: JSON.parse(cur.replies), helpful: cur.helpful, featured: cur.featured, banner: cur.banner, customerId: cur.customerId,
     avatar: cur.avatar ? JSON.parse(cur.avatar) : null,
     createdAt: cur.createdAt.toISOString(), ...patch,
   };

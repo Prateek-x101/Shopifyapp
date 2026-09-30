@@ -471,14 +471,18 @@ function Composer({
               e.currentTarget.style.height = Math.min(140, e.currentTarget.scrollHeight) + "px";
             }}
             onKeyDown={(e) => {
-              if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && text.trim()) formRef.current?.requestSubmit();
+              // Enter sends, Shift+Enter makes a new line (typing with an IME keeps working)
+              if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+                e.preventDefault();
+                if (text.trim() && !busy) formRef.current?.requestSubmit();
+              }
             }}
           />
           <button type="submit" className="cv-send" disabled={busy || !text.trim()} aria-label="Send">
             <svg viewBox="0 0 24 24"><path d="M2.01 21 23 12 2.01 3 2 10l15 2-15 2z" /></svg>
           </button>
         </div>
-        <div className="cv-hint">Ctrl + Enter to send</div>
+        <div className="cv-hint">Enter to send · Shift + Enter for a new line</div>
       </fetcher.Form>
     </div>
   );

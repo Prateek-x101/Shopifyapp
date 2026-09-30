@@ -52,6 +52,7 @@ model Review {
   helpful   Int      @default(0)
   featured  Boolean  @default(false)
   banner    Boolean  @default(false) // shown in the "What our customers say" banner
+  customerId String?                // shopper who wrote it in the store (for blocking)
   hasMedia  Boolean  @default(false)
   needsReply    Boolean   @default(false) // a comment thread ends with a customer message
   commentCount  Int       @default(0)

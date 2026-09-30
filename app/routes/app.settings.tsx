@@ -65,6 +65,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         auto_publish: fd.get("auto_publish") === "on",
         spam_filter: fd.get("spam_filter") === "on",
         auto_block: parseInt(String(fd.get("auto_block") || "0"), 10) || 0,
+        max_comments_per_hour: parseInt(String(fd.get("max_comments_per_hour") || "0"), 10) || 0,
+        max_reviews_per_day: parseInt(String(fd.get("max_reviews_per_day") || "0"), 10) || 0,
         extra_words: String(fd.get("extra_words") || "").split(/[\n,]+/),
       });
       return { ok: true, message: "Moderation saved" };
@@ -278,6 +280,27 @@ export default function Settings() {
               defaultValue={String(data.mod.auto_block)}
               details="0 = never block automatically. Blocked shoppers can't post reviews, comments or replies."
             />
+            <s-grid gridTemplateColumns="1fr 1fr" gap="base">
+              <s-number-field
+                label="Comments & replies per shopper, per hour"
+                name="max_comments_per_hour"
+                min={0}
+                max={200}
+                step={1}
+                defaultValue={String(data.mod.max_comments_per_hour)}
+                details="0 = no limit"
+              />
+              <s-number-field
+                label="Reviews per shopper, per day"
+                name="max_reviews_per_day"
+                min={0}
+                max={50}
+                step={1}
+                defaultValue={String(data.mod.max_reviews_per_day)}
+                details="0 = no limit"
+              />
+            </s-grid>
+            <s-paragraph>Going over a limit shows the shopper a friendly message and counts as a spam strike, so someone who keeps trying gets blocked automatically.</s-paragraph>
             <s-text-area
               label="Extra blocked words"
               name="extra_words"

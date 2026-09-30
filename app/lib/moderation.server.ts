@@ -27,8 +27,13 @@ export type Moderation = {
   spam_filter: boolean;
   auto_block: number; // strikes in 24 h before an automatic block (0 = never)
   blocked: BlockedUser[];
+  max_comments_per_hour: number; // comments + replies one shopper may post per hour (0 = no limit)
+  max_reviews_per_day: number; // reviews one shopper may post per day (0 = no limit)
 };
-const DEFAULTS: Moderation = { buyers_only: true, auto_publish: true, extra_words: [], spam_filter: true, auto_block: 3, blocked: [] };
+const DEFAULTS: Moderation = {
+  buyers_only: true, auto_publish: true, extra_words: [], spam_filter: true, auto_block: 3, blocked: [],
+  max_comments_per_hour: 10, max_reviews_per_day: 2,
+};
 
 /* ───────────────────────── word lists ───────────────────────── */
 // Matched as whole words (after normalising), so "class" or "assistant" never trip "ass".
@@ -99,6 +104,8 @@ export async function getModeration(admin: Admin, shop = ""): Promise<Moderation
       spam_filter: raw.spam_filter === undefined ? DEFAULTS.spam_filter : !!raw.spam_filter,
       auto_block: Number.isFinite(raw.auto_block) ? Math.max(0, Math.min(20, raw.auto_block)) : DEFAULTS.auto_block,
       blocked: Array.isArray(raw.blocked) ? raw.blocked.filter((b: any) => b && b.id).slice(0, 2000) : [],
+      max_comments_per_hour: Number.isFinite(raw.max_comments_per_hour) ? Math.max(0, Math.min(200, raw.max_comments_per_hour)) : DEFAULTS.max_comments_per_hour,
+      max_reviews_per_day: Number.isFinite(raw.max_reviews_per_day) ? Math.max(0, Math.min(50, raw.max_reviews_per_day)) : DEFAULTS.max_reviews_per_day,
     };
   } catch { /* defaults */ }
   if (shop) cache.set(shop, { at: Date.now(), v });
@@ -117,6 +124,8 @@ export async function saveModeration(admin: Admin, shop: string, patch: Partial<
     spam_filter: !!next.spam_filter,
     auto_block: Math.max(0, Math.min(20, Math.round(Number(next.auto_block) || 0))),
     blocked: next.blocked.slice(0, 2000),
+    max_comments_per_hour: Math.max(0, Math.min(200, Math.round(Number(next.max_comments_per_hour) || 0))),
+    max_reviews_per_day: Math.max(0, Math.min(50, Math.round(Number(next.max_reviews_per_day) || 0))),
   };
   const r = await gql(admin, `mutation($m: [MetafieldsSetInput!]!) { metafieldsSet(metafields: $m) { userErrors { field message } } }`, {
     m: [{ ownerId: d.shop.id, namespace: NS, key: KEY, type: "json", value: JSON.stringify(value) }],
@@ -187,4 +196,21 @@ export function addStrike(customerId: string, limit: number) {
   list.push(now);
   strikes.set(customerId, list);
   return limit > 0 && list.length >= limit;
+}
+
+/* ───────────────────────── posting limits ───────────────────────── */
+const posts = new Map<string, number[]>(); // "c:<customer>" / "r:<customer>" → times
+
+/** True when this post would go over the limit (the post is not counted then). 0 = no limit. */
+export function overLimit(kind: "comment" | "review", customerId: string, mod: Moderation) {
+  const max = kind === "comment" ? mod.max_comments_per_hour : mod.max_reviews_per_day;
+  if (!max || !customerId) return false;
+  const windowMs = kind === "comment" ? 3600e3 : 24 * 3600e3;
+  const key = `${kind[0]}:${customerId}`;
+  const now = Date.now();
+  const list = (posts.get(key) || []).filter((t) => now - t < windowMs);
+  if (list.length >= max) { posts.set(key, list); return true; }
+  list.push(now);
+  posts.set(key, list);
+  return false;
 }

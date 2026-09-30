@@ -10,7 +10,7 @@
  */
 import prisma from "../db.server";
 import { customerFromToken, googleLogin } from "./google-login.server";
-import { addStrike, blockUser, getModeration, isAbusive, isBlocked, spamReason } from "./moderation.server";
+import { addStrike, blockUser, getModeration, isAbusive, isBlocked, overLimit, spamReason } from "./moderation.server";
 import {
   addComment,
   createReview,
@@ -161,6 +161,11 @@ export async function legacyPost(admin: Admin, shop: string, sp: URLSearchParams
     }
     const mod = await getModeration(admin, shop);
     if (isBlocked(mod, customerId)) return json({ success: false, error: "You can't post reviews on this store." }, { status: 403 });
+    if (customerId && overLimit("review", customerId, mod)) {
+      // hitting the limit counts as a spam strike; enough strikes → blocked
+      if (addStrike(customerId, mod.auto_block)) await blockUser(admin, shop, { id: customerId, name, reason: "Automatic: too many reviews" });
+      return json({ success: false, error: `You can post up to ${mod.max_reviews_per_day} reviews a day. Please try again tomorrow.` }, { status: 429 });
+    }
     // only people who ordered this product may review it (setting "Only buyers can review", on by default)
     if ((mod.buyers_only || body.requireLoginToReview) && !customerId) {
       return json({
@@ -208,6 +213,7 @@ export async function legacyPost(admin: Admin, shop: string, sp: URLSearchParams
     const status = flagged || !mod.auto_publish ? "pending" : "published";
     await createReview(admin, shop, {
       productId, rating, body: text, author: name, status, verified, orderId, images, source: "Website", location,
+      customerId: customerId || null,
     });
     return json({
       success: true,
@@ -233,6 +239,10 @@ export async function legacyPost(admin: Admin, shop: string, sp: URLSearchParams
     // blocked shoppers can't post; spam and abusive words wait for the admin (Engine → Comments)
     const mod = await getModeration(admin, shop);
     if (isBlocked(mod, customerId)) return json({ success: false, error: "You can't comment on this store." }, { status: 403 });
+    if (overLimit("comment", customerId, mod)) {
+      if (addStrike(customerId, mod.auto_block)) await blockUser(admin, shop, { id: customerId, name: name || "Customer", reason: "Automatic: too many comments" });
+      return json({ success: false, error: `You can post up to ${mod.max_comments_per_hour} comments an hour. Please wait a little.` }, { status: 429 });
+    }
     const spam = mod.spam_filter ? spamReason(customerId, text) : "";
     if (spam && addStrike(customerId, mod.auto_block)) {
       await blockUser(admin, shop, { id: customerId, name: name || "Customer", reason: `Automatic: spam (${spam})` });
