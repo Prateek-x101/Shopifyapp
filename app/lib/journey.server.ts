@@ -84,8 +84,9 @@ export async function saveJourney(admin: Admin, input: JourneyInput) {
   const id = cartId(input.cart);
   if (id.length < 10) throw new Error("Bad cart");
   await ensureDefinition(admin);
+  // readable tags like "4 Reviews: 45 sec"; Shopify tags can't contain commas
   const tags = (Array.isArray(input.tags) ? input.tags : [])
-    .map((t) => clean(t, 30).toLowerCase().replace(/[^a-z0-9:+_-]/g, ""))
+    .map((t) => clean(t, 60).replace(/,/g, " ").replace(/[^\p{L}\p{N} :/()+.·&'-]/gu, "").replace(/\s+/g, " ").trim())
     .filter(Boolean)
     .slice(0, 12);
   let data = "";
@@ -135,7 +136,7 @@ export async function applyJourneyToOrder(admin: Admin, order: any) {
   if (!mo) return { applied: false, reason: "no journey for cart " + token };
 
   const summary = String(mo.summary?.value || "").trim();
-  const note = [String(order?.note || "").trim(), `${NOTE_MARK}: ${summary}`].filter(Boolean).join("\n\n");
+  const note = [String(order?.note || "").trim(), `${NOTE_MARK}\n${summary}`].filter(Boolean).join("\n\n");
   const up = await gql(admin, `mutation($input: OrderInput!) { orderUpdate(input: $input) { userErrors { message } } }`,
     { input: { id: orderGid, note: note.slice(0, 5000) } });
   if (up.orderUpdate.userErrors?.length) throw new Error(JSON.stringify(up.orderUpdate.userErrors));
