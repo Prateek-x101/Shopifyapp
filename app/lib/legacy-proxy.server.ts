@@ -10,6 +10,7 @@
  */
 import prisma from "../db.server";
 import { customerFromToken, googleLogin } from "./google-login.server";
+import { ensureOrdersWebhook, saveJourney } from "./journey.server";
 import { addStrike, blockUser, getModeration, isAbusive, isBlocked, overLimit, spamReason } from "./moderation.server";
 import {
   addComment,
@@ -148,6 +149,21 @@ export async function legacyPost(admin: Admin, shop: string, sp: URLSearchParams
     } catch (e: any) {
       return json({ success: false, error: e?.message || "Google sign-in failed" }, { status: 400 });
     }
+  }
+
+  /* ── visitor journey (storefront engine-journey.js) ── */
+  if (actionType === "journey") {
+    if (limited(`j:${ip}`, 40)) return json({ success: false, error: "Too many updates" }, { status: 429 });
+    const cart = String(body.cart || "");
+    if (!/^[A-Za-z0-9_-]{10,80}(\?key=[A-Za-z0-9]+)?$/.test(cart)) return json({ success: false, error: "Bad cart" }, { status: 400 });
+    await saveJourney(admin, {
+      cart,
+      summary: String(body.summary || ""),
+      tags: Array.isArray(body.tags) ? body.tags : [],
+      data: body.data,
+    });
+    ensureOrdersWebhook(admin).catch((e) => console.error("[journey] orders webhook", e));
+    return json({ success: true });
   }
 
   /* ── new review ── */
