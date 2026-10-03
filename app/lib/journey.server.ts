@@ -79,14 +79,23 @@ const clean = (s: unknown, max: number) => String(s ?? "").replace(/[\u0000-\u00
 
 export type JourneyInput = { cart: string; summary: string; tags: string[]; data: unknown };
 
+/** Shopify rejects the whole tagsAdd call if one order tag is over 40 characters or has a comma */
+export function fitTag(t: string) {
+  let s = String(t || "").replace(/,/g, " ").replace(/[^\p{L}\p{N} :/()+.·&'-]/gu, "").replace(/\s+/g, " ").trim();
+  // "Facebook ad (Single content- Reel)" → "Facebook ad · Reel"
+  if (s.length > 40) s = s.replace(/\s*\(([^)]*)\)/, (_m, inner: string) => " · " + String(inner).split(/[-–|]/).pop()!.trim());
+  if (s.length > 40) s = s.slice(0, 40).replace(/\s+\S*$/, "").replace(/[\s(·:/-]+$/, "");
+  return s.slice(0, 40);
+}
+
 /** Save / replace the journey of one cart */
 export async function saveJourney(admin: Admin, input: JourneyInput) {
   const id = cartId(input.cart);
   if (id.length < 10) throw new Error("Bad cart");
   await ensureDefinition(admin);
-  // readable tags like "4 Reviews: 45 sec"; Shopify tags can't contain commas
+  // readable tags like "4 Reviews: 45 sec"; Shopify order tags: no commas, at most 40 characters
   const tags = (Array.isArray(input.tags) ? input.tags : [])
-    .map((t) => clean(t, 60).replace(/,/g, " ").replace(/[^\p{L}\p{N} :/()+.·&'-]/gu, "").replace(/\s+/g, " ").trim())
+    .map((t) => fitTag(clean(t, 80)))
     .filter(Boolean)
     .slice(0, 12);
   let data = "";
@@ -141,10 +150,19 @@ export async function applyJourneyToOrder(admin: Admin, order: any) {
     { input: { id: orderGid, note: note.slice(0, 5000) } });
   if (up.orderUpdate.userErrors?.length) throw new Error(JSON.stringify(up.orderUpdate.userErrors));
 
-  const tags = String(mo.tags?.value || "").split(",").map((t) => t.trim()).filter(Boolean);
+  const tags = String(mo.tags?.value || "").split(",").map((t) => fitTag(t)).filter(Boolean);
   if (tags.length) {
-    await gql(admin, `mutation($id: ID!, $tags: [String!]!) { tagsAdd(id: $id, tags: $tags) { userErrors { message } } }`,
-      { id: orderGid, tags });
+    const addTags = (list: string[]) => gql(admin, `mutation($id: ID!, $tags: [String!]!) { tagsAdd(id: $id, tags: $tags) { userErrors { message } } }`,
+      { id: orderGid, tags: list });
+    const r = await addTags(tags);
+    if (r.tagsAdd.userErrors?.length) {
+      // one bad tag fails the whole call: add them one by one so the rest still land
+      console.error(`[journey] tagsAdd ${order?.name}:`, JSON.stringify(r.tagsAdd.userErrors));
+      for (const t of tags) {
+        const one = await addTags([t]);
+        if (one.tagsAdd.userErrors?.length) console.error(`[journey] tag rejected "${t}"`);
+      }
+    }
   }
   await gql(admin, `mutation($id: ID!, $m: MetaobjectUpdateInput!) { metaobjectUpdate(id: $id, metaobject: $m) { userErrors { message } } }`,
     { id: mo.id, m: { fields: [{ key: "order", value: String(order?.name || order?.id || "") }] } });
