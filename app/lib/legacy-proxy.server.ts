@@ -1,7 +1,8 @@
 /**
  * Storefront review widget API (engine-review-widget / review-widget.js).
  *
- *   GET  /apps/engine?action=get_reviews_page&productId=123&page=1
+ *   GET  /apps/engine?action=get_reviews_page&productId=123&offset=0&limit=30   (older widget: &page=1)
+ *   GET  /apps/engine?action=get_review_media&productId=123
  *   GET  /apps/engine?action=get_review_stats&productId=123
  *   GET  /apps/engine?action=sales_popup_feed
  *   POST /apps/engine   JSON { actionType: submit_review | submit_comment | submit_reply | set_helpful | set_thread_like, ... }
@@ -18,6 +19,7 @@ import {
   resolveClientCommentId,
   gql,
   legacyPage,
+  reviewMedia,
   getVotes,
   setHelpful,
   setThreadLike,
@@ -57,9 +59,21 @@ export async function legacyGet(shop: string, sp: URLSearchParams, admin: Admin 
     if (customerId && admin) {
       try { votes = await getVotes(admin, shop, customerId); } catch { votes = null; }
     }
-    return json(await legacyPage(shop, productId, page, customerId, votes), {
+    // newer widget: offset + limit (only what the shopper needs); older one: page numbers
+    const range = sp.has("offset")
+      ? {
+        offset: Math.max(0, parseInt(sp.get("offset") || "0", 10) || 0),
+        limit: Math.min(100, Math.max(1, parseInt(sp.get("limit") || "30", 10) || 30)),
+      }
+      : null;
+    return json(await legacyPage(shop, productId, page, customerId, votes, range), {
       headers: { "Cache-Control": customerId ? "private, no-store" : "public, max-age=30" },
     });
+  }
+
+  if (action === "get_review_media") {
+    if (!productId) return json({ success: false, error: "productId required" }, { status: 400 });
+    return json(await reviewMedia(shop, productId), { headers: { "Cache-Control": "public, max-age=60" } });
   }
 
   if (action === "get_review_stats") {

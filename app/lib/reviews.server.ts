@@ -518,11 +518,17 @@ export function legacyReview(r: any, helpfulByCustomerIds: string[] = [], likedB
   };
 }
 
-/** Page of reviews for the widget. Page 1 = first 250, page N>1 = 10 reviews from (N-1)*10 (the widget's paging). */
-export async function legacyPage(shop: string, productId: string, page: number, customerId = "", votes: VoteList | null = null) {
+/**
+ * Page of reviews for the widget. With `range` the widget asks for exactly what it needs (offset + limit, max 100);
+ * without it (older widget): page 1 = first 250, page N>1 = 10 reviews from (N-1)*10.
+ */
+export async function legacyPage(
+  shop: string, productId: string, page: number, customerId = "", votes: VoteList | null = null,
+  range: { offset: number; limit: number } | null = null,
+) {
   const where = { shop, productId, status: "published" };
-  const take = page <= 1 ? 250 : 10;
-  const skip = page <= 1 ? 0 : (page - 1) * 10;
+  const take = range ? range.limit : page <= 1 ? 250 : 10;
+  const skip = range ? range.offset : page <= 1 ? 0 : (page - 1) * 10;
   const [total, rows] = await Promise.all([
     prisma.review.count({ where }),
     prisma.review.findMany({ where, orderBy: [{ featured: "desc" }, { createdAt: "desc" }], skip, take }),
@@ -536,8 +542,38 @@ export async function legacyPage(shop: string, productId: string, page: number, 
     count: rows.length,
     totalCount: total,
     pageCount: Math.max(1, Math.ceil(total / 10)),
+    offset: skip,
     hasMore: skip + rows.length < total,
   };
+}
+
+/** Every customer photo/video of a product, newest reviews first (the widget's "Customer photos" page). */
+export async function reviewMedia(shop: string, productId: string) {
+  const rows = await prisma.review.findMany({
+    where: { shop, productId, status: "published", NOT: { images: "[]" } },
+    orderBy: [{ featured: "desc" }, { createdAt: "desc" }],
+    take: 500,
+    select: { id: true, author: true, rating: true, verified: true, body: true, location: true, createdAt: true, images: true, avatar: true },
+  });
+  const reviews = rows.map((r) => {
+    let images: ReviewImage[] = [];
+    try { images = JSON.parse(r.images || "[]"); } catch { images = []; }
+    let avatar: string | null = null;
+    try { avatar = r.avatar ? JSON.parse(r.avatar)?.url || null : null; } catch { avatar = null; }
+    return {
+      id: String(r.id).split("/").pop(),
+      name: r.author,
+      rating: r.rating,
+      verified: !!r.verified,
+      text: String(r.body || "").slice(0, 220),
+      location: r.location || "",
+      date: new Date(r.createdAt).toISOString(),
+      avatar,
+      images: images.filter((i) => i.url && i.kind !== "video").map((i) => i.url),
+      videos: images.filter((i) => i.url && i.kind === "video").map((i) => i.url),
+    };
+  }).filter((r) => r.images.length || r.videos.length);
+  return { success: true, count: reviews.reduce((n, r) => n + r.images.length + r.videos.length, 0), reviews };
 }
 
 /* ───────────────────────── comments, replies, votes ───────────────────────── */
