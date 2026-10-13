@@ -398,6 +398,53 @@ const CSS = `
 .rp-btn[disabled] { opacity: .5; cursor: default; }
 `;
 
+/* ───────────────────────── ✨ AI insights: what customers say about this product ───────────────────────── */
+function AiInsights({ data, busy }: { data: any; busy: boolean }) {
+  if (busy) {
+    return (
+      <s-box padding="large">
+        <s-stack gap="base" alignItems="center">
+          <s-spinner accessibilityLabel="Reading the reviews" />
+          <s-text color="subdued">AI is reading this product's reviews…</s-text>
+        </s-stack>
+      </s-box>
+    );
+  }
+  if (!data) return <s-box padding="large"><s-text color="subdued">Click “AI insights” to start.</s-text></s-box>;
+  if (!data.ok) return <s-box padding="base"><s-banner tone="critical">{data.message || "AI couldn't read the reviews"}</s-banner></s-box>;
+  const x = data.insights;
+  const block = (title: string, list: string[], empty: string) => (
+    <s-stack gap="small-200">
+      <s-heading>{title}</s-heading>
+      {list.length ? (
+        <s-unordered-list>{list.map((t: string) => <s-list-item key={t}>{t}</s-list-item>)}</s-unordered-list>
+      ) : (
+        <s-text color="subdued">{empty}</s-text>
+      )}
+    </s-stack>
+  );
+  return (
+    <s-box padding="base">
+      <s-stack gap="large">
+        <s-banner tone="info">{x.summary}</s-banner>
+        <s-grid gridTemplateColumns="1fr 1fr" gap="large">
+          {block("👍 What customers like", x.likes, "Nothing stands out yet.")}
+          {block("👎 Complaints", x.complaints, "No complaints found.")}
+        </s-grid>
+        <s-stack gap="small-200">
+          <s-heading>📏 Size &amp; fit</s-heading>
+          <s-paragraph>{x.sizing || "Not mentioned"}</s-paragraph>
+        </s-stack>
+        <s-grid gridTemplateColumns="1fr 1fr" gap="large">
+          {block("❓ Open questions in comments", x.questions, "No open questions.")}
+          {block("✅ What to do next", x.actions, "Nothing urgent.")}
+        </s-grid>
+        <s-text color="subdued">Based on {data.count} published review{data.count === 1 ? "" : "s"}. AI can miss things: check before acting.</s-text>
+      </s-stack>
+    </s-box>
+  );
+}
+
 /* ───────────────────────── status + date (click the status to change it) ───────────────────────── */
 const STATUS_LABEL: Record<string, string> = { published: "Published", pending: "Pending", hidden: "Hidden" };
 function StatusCell({ r }: { r: Row }) {
@@ -685,6 +732,7 @@ function DateFilter({ from, to, onApply }: { from: string; to: string; onApply: 
 /* ───────────────────────── page ───────────────────────── */
 export default function ProductReviews() {
   const { product, shopName, byStatus, sourceCounts, mediaCount, commentCounts, list } = useLoaderData<typeof loader>();
+  const insights = useFetcher<any>(); // ✨ AI insights (loaded when the popup opens)
   const flaggedCount = commentCounts.waiting;
   const needsCount = commentCounts.needs;
   const allCount = byStatus.published + byStatus.pending + byStatus.hidden;
@@ -811,6 +859,15 @@ export default function ProductReviews() {
     <s-page heading={product.title} inlineSize="large">
       <s-link slot="breadcrumb-actions" href="/app/reviews">Reviews</s-link>
       <s-button slot="primary-action" variant="primary" href={`/app/reviews/${product.id}/new`}>Add review</s-button>
+      <s-button
+        slot="secondary-actions"
+        icon="wand"
+        commandFor="ai-insights-modal"
+        command="--show"
+        onClick={() => { if (insights.state === "idle") insights.submit({ intent: "insights", productId: product.id }, { method: "POST", action: "/app/ai" }); }}
+      >
+        AI insights
+      </s-button>
       <s-button slot="secondary-actions" icon="upload" commandFor="bulk-modal" command="--show">Bulk upload</s-button>
       <s-button slot="secondary-actions" icon="export" onClick={() => runExport(true)} {...(exportBusy ? { loading: true } : {})}>
         Export{anyFilter || status !== "all" ? " filtered" : ""}
@@ -1084,6 +1141,19 @@ export default function ProductReviews() {
             onConversation={() => openThread(viewRow.id)}
           />
         )}
+      </s-modal>
+
+      {/* ✨ AI insights */}
+      <s-modal id="ai-insights-modal" heading={`✨ What customers say · ${product.title}`} size="large">
+        <AiInsights data={insights.data} busy={insights.state !== "idle"} />
+        <s-button
+          slot="secondary-actions"
+          onClick={() => insights.submit({ intent: "insights", productId: product.id }, { method: "POST", action: "/app/ai" })}
+          {...(insights.state !== "idle" ? { loading: true } : {})}
+        >
+          Refresh
+        </s-button>
+        <s-button slot="primary-action" commandFor="ai-insights-modal" command="--hide">Close</s-button>
       </s-modal>
 
       {/* conversation popup */}

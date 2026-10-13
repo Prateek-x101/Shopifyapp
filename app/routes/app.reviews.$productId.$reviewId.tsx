@@ -1,5 +1,5 @@
 import type { ActionFunctionArgs, HeadersFunction, LoaderFunctionArgs } from "react-router";
-import { Form, useActionData, useLoaderData, useNavigation } from "react-router";
+import { Form, useActionData, useFetcher, useLoaderData, useNavigation } from "react-router";
 import { useEffect, useState } from "react";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { boundary } from "@shopify/shopify-app-react-router/server";
@@ -42,6 +42,82 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   }
   return { productId, productTitle: d.product?.title || "Product", shopName: d.shop.name as string, isNew, review, people: peopleOf(review) };
 };
+
+/**
+ * ✨ A real customer's feedback (pasted WhatsApp message or a chat screenshot) → the review form below,
+ * in the customer's own words. The admin checks it and saves.
+ */
+function AiFromMessage({ productId, onName }: { productId: string; onName: (n: string) => void }) {
+  const fetcher = useFetcher<any>();
+  const shopify = useAppBridge();
+  const busy = fetcher.state !== "idle";
+  const [shot, setShot] = useState<string>("");
+  const [notes, setNotes] = useState<string[]>([]);
+  useEffect(() => {
+    const d: any = fetcher.data;
+    if (!d) return;
+    if (!d.ok) { shopify.toast.show(d.message || "AI couldn't read it", { isError: true }); return; }
+    const r = d.draft;
+    const form = document.getElementById("review-form");
+    const put = (name: string, v: string) => {
+      const el: any = form?.querySelector(`[name="${name}"]`);
+      if (!el || !v) return;
+      el.value = v;
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    };
+    put("author", r.author);
+    if (r.author) onName(r.author);
+    put("location", r.city);
+    if (r.rating) put("rating", String(r.rating));
+    put("body", r.body);
+    const n = [...(r.notes || [])];
+    if (!r.rating) n.unshift("No clear rating in the message: set the stars yourself.");
+    if (!r.author) n.unshift("Name not found: type the customer's name.");
+    setNotes(n);
+    shopify.toast.show("Review filled in. Check it, then Save.");
+    document.getElementById("review-form")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, [fetcher.data]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  return (
+    <s-section heading="✨ Fill from a customer's message">
+      <fetcher.Form method="post" action="/app/ai" encType="multipart/form-data">
+        <input type="hidden" name="intent" value="draft" />
+        <input type="hidden" name="productId" value={productId} />
+        <s-stack gap="base">
+          <s-paragraph>
+            Got feedback from a customer on WhatsApp? Paste their message or add a screenshot of the chat. AI fills the form below with
+            their name, city, stars and words. Use only real messages from your customers.
+          </s-paragraph>
+          <s-text-area label="Customer's message" name="text" rows={4} placeholder="Paste the customer's message here…" />
+          <s-stack direction="inline" gap="base" alignItems="center">
+            <input
+              type="file"
+              name="image"
+              accept="image/png,image/jpeg,image/webp"
+              onChange={(e) => {
+                const f = e.currentTarget.files?.[0];
+                setShot(f ? URL.createObjectURL(f) : "");
+              }}
+            />
+            {shot && <img src={shot} alt="Chat screenshot" style={{ height: 64, borderRadius: 6, border: "1px solid #e3e3e3" }} />}
+          </s-stack>
+          <s-checkbox name="translate" value="true" label="Translate into English (otherwise keeps the customer's language)" />
+          {notes.length > 0 && (
+            <s-banner tone="warning">
+              <s-unordered-list>
+                {notes.map((n) => <s-list-item key={n}>{n}</s-list-item>)}
+              </s-unordered-list>
+            </s-banner>
+          )}
+          <s-stack direction="inline" justifyContent="end">
+            <s-button type="submit" {...(busy ? { loading: true } : {})}>✨ Fill the review</s-button>
+          </s-stack>
+        </s-stack>
+      </fetcher.Form>
+    </s-section>
+  );
+}
 
 const fileOf = (v: FormDataEntryValue | null) => (v && typeof v !== "string" && v.size > 0 ? v : null);
 
@@ -216,6 +292,8 @@ export default function EditReview() {
   return (
     <s-page heading={isNew ? "Add review" : `Review by ${r.author}`}>
       <s-link slot="breadcrumb-actions" href={`/app/reviews/${productId}`}>{productTitle}</s-link>
+
+      {isNew && <AiFromMessage productId={productId} onName={setAuthorName} />}
 
       <Form method="post" encType="multipart/form-data" id="review-form">
         <input type="hidden" name="intent" value="save" />

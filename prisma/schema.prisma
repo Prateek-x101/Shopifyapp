@@ -79,3 +79,14 @@ model Vote {
   @@unique([targetId, customerId, kind])
   @@index([reviewId])
 }
+
+// AI (Google Gemini) per shop. The API key is encrypted (lib/ai.server.ts) and never leaves the server.
+model AiConfig {
+  shop      String   @id
+  apiKey    String   @default("")          // sealed with AES-256-GCM
+  model     String   @default("gemini-2.5-flash")
+  voice     String   @default("")          // how the store talks (tone, sign-off…)
+  facts     String   @default("")          // delivery, exchange, COD… the AI may use these, nothing else
+  language  String   @default("auto")      // auto | english | hinglish
+  updatedAt DateTime @updatedAt
+}

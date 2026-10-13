@@ -130,6 +130,10 @@ export const CV_CSS = `
 .cv-file { font-size: 12px; color: #707070; max-width: 190px; }
 .cv-hint { margin-top: 6px; font-size: 11px; color: #b0b0b0; text-align: right; }
 .cv-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 6px; }
+.cv-ai { border: 1px solid #d9c8ff; background: linear-gradient(135deg, #f5f0ff, #eef4ff); color: #4b2bb3; border-radius: 999px; padding: 3px 12px;
+  font: inherit; font-size: 12px; font-weight: 600; cursor: pointer; }
+.cv-ai:hover:not([disabled]) { border-color: #a98bff; }
+.cv-ai[disabled] { opacity: .55; cursor: default; }
 .cv-foot .cv-hint { margin-top: 0; }
 .cv-when { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: #616161; }
 .cv-when-chip { border: 1px solid #e3e3e3; background: #fff; border-radius: 999px; padding: 3px 10px; font: inherit; font-size: 12px; color: #303030; cursor: pointer; }
@@ -239,7 +243,7 @@ export function Thread({
             <Node key={c.id} node={c} depth={0} onReply={(n) => setTarget({ id: n.id, name: n.name })} activeId={target?.id} />
           ))}
         </div>
-        <Composer target={target} onDone={() => setTarget(null)} shopName={shopName} people={people} />
+        <Composer target={target} onDone={() => setTarget(null)} shopName={shopName} people={people} reviewId={String(review.id || "")} />
       </div>
     </ActionUrl.Provider>
   );
@@ -410,11 +414,13 @@ function Composer({
   onDone,
   shopName,
   people,
+  reviewId,
 }: {
   target: { id: string; name: string } | null;
   onDone: () => void;
   shopName: string;
   people: { name: string; avatar: string | null }[];
+  reviewId: string;
 }) {
   const fetcher = useFetcher<any>();
   const actionUrl = useContext(ActionUrl);
@@ -427,6 +433,33 @@ function Composer({
   const [when, setWhen] = useState(""); // "" = now
   const [pickWhen, setPickWhen] = useState(false);
   const busy = fetcher.state !== "idle";
+  // ✨ AI: writes the store's reply (or polishes what's typed); the admin reads it and sends
+  const ai = useFetcher<any>();
+  const aiBusy = ai.state !== "idle";
+  const aiPolish = !!text.trim();
+  useEffect(() => {
+    const d: any = ai.data;
+    if (!d) return;
+    if (d.ok && d.text) {
+      setText(d.text);
+      requestAnimationFrame(() => {
+        const ta = msgRef.current;
+        if (!ta) return;
+        ta.style.height = "auto";
+        ta.style.height = Math.min(140, ta.scrollHeight) + "px";
+        ta.focus();
+      });
+    } else if (d.message) {
+      shopify.toast.show(d.message, { isError: d.ok === false });
+    }
+  }, [ai.data]); // eslint-disable-line react-hooks/exhaustive-deps
+  const askAi = () => {
+    if (as !== "store") { shopify.toast.show("AI writes replies only as your store. Choose your store in “Reply as”.", { isError: true }); return; }
+    ai.submit(
+      { intent: aiPolish ? "improve" : "reply", reviewId, targetId: target?.id || "", draft: text },
+      { method: "POST", action: "/app/ai" },
+    );
+  };
   const person = as.startsWith("person:") ? people.find((p) => `person:${p.name}` === as) : null;
   const asName = as === "store" ? shopName : as === "new" ? "New person" : as.slice(7);
 
@@ -519,6 +552,15 @@ function Composer({
         </div>
         <div className="cv-foot">
           <div className="cv-when">
+            <button
+              type="button"
+              className="cv-ai"
+              onClick={askAi}
+              disabled={aiBusy || busy}
+              title={as !== "store" ? "AI replies only as your store" : aiPolish ? "Rewrite what you typed so it reads well" : target ? `Write the store's reply to ${target.name}` : "Write the store's reply to this review"}
+            >
+              ✨ {aiBusy ? "Writing…" : aiPolish ? "Improve" : "AI reply"}
+            </button>
             {pickWhen ? (
               <>
                 <span>📅</span>

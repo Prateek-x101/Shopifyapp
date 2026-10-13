@@ -1,6 +1,6 @@
 import type { ActionFunctionArgs, HeadersFunction, LoaderFunctionArgs } from "react-router";
 import { useFetcher, useLoaderData } from "react-router";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
@@ -8,24 +8,55 @@ import { ensureSettingsDefinition, getSettings, saveSettings } from "../lib/sett
 import { getModeration, saveModeration, unblockUser } from "../lib/moderation.server";
 import { repairWidget, widgetStatus } from "../lib/theme-repair.server";
 import { recomputeAllSummaries } from "../lib/reviews.server";
+import { AiError, DEFAULT_MODEL, getAiSettings, listModels, saveAiSettings } from "../lib/ai.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
   await ensureSettingsDefinition(admin);
-  const [s, mod, widget] = await Promise.all([
+  const [s, mod, widget, ai] = await Promise.all([
     getSettings(admin),
     getModeration(admin),
     widgetStatus(admin).catch((e: any) => ({ theme: "", found: false, missing: [] as string[], error: String(e?.message || e) })),
+    getAiSettings(session.shop),
   ]);
   return {
     google_login: s.google_login, google_client_id: s.google_client_id, login_mode: s.login_mode, shop: session.shop, mod, widget,
     banner: { mode: s.banner_mode, max: s.banner_max, min: s.banner_min_rating, shuffle: s.banner_shuffle },
+    ai,
   };
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
   const fd = await request.formData();
+  const intent = String(fd.get("intent") || "");
+  if (intent === "ai-save" || intent === "ai-check" || intent === "ai-remove") {
+    try {
+      if (intent === "ai-remove") {
+        await saveAiSettings(session.shop, { apiKey: null });
+        return { ok: true, message: "Gemini key removed", models: [] as string[] };
+      }
+      const newKey = String(fd.get("apiKey") || "").trim();
+      // the key (a newly typed one, or the saved one) is checked by listing its models; a wrong key is never saved
+      const hasKey = newKey ? true : (await getAiSettings(session.shop)).hasKey;
+      if (intent === "ai-check" && !hasKey) return { ok: false, message: "Paste your Gemini API key first", models: [] as string[] };
+      const models = hasKey ? await listModels(session.shop, newKey || undefined) : [];
+      if (intent === "ai-check") {
+        return { ok: true, message: `Key works · ${models.length} Gemini models available`, models };
+      }
+      const model = String(fd.get("model") || DEFAULT_MODEL);
+      await saveAiSettings(session.shop, {
+        ...(newKey ? { apiKey: newKey } : {}),
+        model: models.length && !models.includes(model) ? models.find((m) => /flash/i.test(m)) || models[0] : model,
+        voice: String(fd.get("voice") || ""),
+        facts: String(fd.get("facts") || ""),
+        language: String(fd.get("language") || "auto"),
+      });
+      return { ok: true, message: "AI settings saved", models };
+    } catch (e: any) {
+      return { ok: false, message: e instanceof AiError ? e.message : e?.message || "Could not save", models: [] as string[] };
+    }
+  }
   if (fd.get("intent") === "repair-widget") {
     try {
       const r = await repairWidget(admin);
@@ -90,6 +121,102 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return { ok: false, message: e?.message || "Could not save" };
   }
 };
+
+function AiSection({ ai }: { ai: { hasKey: boolean; keyHint: string; model: string; voice: string; facts: string; language: string } }) {
+  const fetcher = useFetcher<typeof action>();
+  const shopify = useAppBridge();
+  const [models, setModels] = useState<string[]>([]);
+  const busy = fetcher.state !== "idle";
+  const doing = busy ? String(fetcher.formData?.get("intent") || "") : "";
+  useEffect(() => {
+    const d: any = fetcher.data;
+    if (!d?.message) return;
+    shopify.toast.show(d.message, { isError: !d.ok });
+    if (Array.isArray(d.models) && d.models.length) setModels(d.models);
+  }, [fetcher.data, shopify]);
+  const options = Array.from(new Set([ai.model, ...models])).filter(Boolean);
+  const formRef = useRef<HTMLFormElement>(null);
+  const run = (which: string) => {
+    if (!formRef.current) return;
+    const fd = new FormData(formRef.current);
+    fd.set("intent", which);
+    fetcher.submit(fd, { method: "POST" });
+  };
+  const factsExample = [
+    "Prepaid orders: 5% off + free delivery. COD fee Rs 30.",
+    "COD orders ship in 7-12 working days after confirmation.",
+    "Easy size exchange within 7 days of delivery.",
+    "WhatsApp help: +1 555 324 9944",
+  ].join("\n");
+
+  return (
+    <fetcher.Form method="post" ref={formRef} onSubmit={(e) => { e.preventDefault(); run("ai-save"); }}>
+      <s-section heading="AI (Google Gemini)">
+        <s-stack gap="base">
+          {ai.hasKey ? (
+            <s-banner tone="success">
+              Gemini key saved ({ai.keyHint}). The AI buttons in Reviews are on: store replies, filling a review from a customer's message, and insights.
+            </s-banner>
+          ) : (
+            <s-banner tone="info">Add your Gemini API key to turn on the AI buttons in Reviews.</s-banner>
+          )}
+          <s-password-field
+            label={ai.hasKey ? "New Gemini API key (leave empty to keep the saved one)" : "Gemini API key"}
+            name="apiKey"
+            autocomplete="off"
+            placeholder="AIza..."
+            details="Kept encrypted in the app's database. It never goes to the store or the browser."
+          />
+          <s-grid gridTemplateColumns="1fr 1fr" gap="base">
+            <s-select label="Model" name="model" value={ai.model}>
+              {options.map((m) => <s-option key={m} value={m}>{m}</s-option>)}
+            </s-select>
+            <s-select label="Reply language" name="language" value={ai.language}>
+              <s-option value="auto">Same as the customer (recommended)</s-option>
+              <s-option value="english">Always English</s-option>
+              <s-option value="hinglish">Always Hinglish</s-option>
+            </s-select>
+          </s-grid>
+          <s-text-area
+            label="How your store talks"
+            name="voice"
+            rows={3}
+            defaultValue={ai.voice}
+            placeholder="Friendly and short, like a helpful shop owner. Call customers by first name."
+          />
+          <s-text-area
+            label="Store facts the AI may use"
+            name="facts"
+            rows={5}
+            defaultValue={ai.facts}
+            placeholder={factsExample}
+            details="The AI only states facts written here (offers, delivery, exchange, contact). For anything else it asks the customer to message you."
+          />
+          <s-stack direction="inline" gap="small-200" justifyContent="end">
+            {ai.hasKey && (
+              <s-button
+                tone="critical"
+                variant="tertiary"
+                onClick={() => {
+                  if (confirm("Remove the Gemini key? The AI buttons stop working until you add one again.")) fetcher.submit({ intent: "ai-remove" }, { method: "POST" });
+                }}
+                {...(doing === "ai-remove" ? { loading: true } : {})}
+              >
+                Remove key
+              </s-button>
+            )}
+            <s-button onClick={() => run("ai-check")} {...(doing === "ai-check" ? { loading: true } : {})}>
+              Check key &amp; load models
+            </s-button>
+            <s-button onClick={() => run("ai-save")} variant="primary" {...(doing === "ai-save" ? { loading: true } : {})}>
+              Save
+            </s-button>
+          </s-stack>
+        </s-stack>
+      </s-section>
+    </fetcher.Form>
+  );
+}
 
 function UnblockRow({ b }: { b: { id: string; name: string; at: string; reason: string } }) {
   const fetcher = useFetcher<typeof action>();
@@ -316,6 +443,8 @@ export default function Settings() {
         </s-section>
       </modFetcher.Form>
 
+      <AiSection ai={data.ai} />
+
       <s-section heading={`Blocked shoppers (${data.mod.blocked.length})`}>
         {data.mod.blocked.length === 0 ? (
           <s-paragraph>Nobody is blocked. Use “Block” on a comment (Comments page or a review’s conversation), or let the spam filter do it.</s-paragraph>
@@ -326,6 +455,18 @@ export default function Settings() {
             ))}
           </s-stack>
         )}
+      </s-section>
+
+      <s-section slot="aside" heading="Get a Gemini API key">
+        <s-ordered-list>
+          <s-list-item>Open aistudio.google.com and sign in with your Google account.</s-list-item>
+          <s-list-item>Click "Get API key", then "Create API key", and copy it.</s-list-item>
+          <s-list-item>Paste it in "Gemini API key", click "Check key &amp; load models", pick a Flash model and Save.</s-list-item>
+        </s-ordered-list>
+        <s-paragraph>
+          The free tier has a daily limit, and on the free tier Google may use what you send to improve its products. The app sends
+          only review and comment text (no phone numbers or addresses). Turn on billing in AI Studio to lift the limit.
+        </s-paragraph>
       </s-section>
 
       <s-section slot="aside" heading="Get a Google Client ID">
