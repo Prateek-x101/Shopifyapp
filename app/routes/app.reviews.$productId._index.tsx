@@ -17,7 +17,8 @@ import {
 } from "../lib/reviews.server";
 import type { ReviewFilters } from "../lib/reviews.server";
 import { COMMENT_FILTERS, countComments, normalizeComments } from "../lib/reviews.shared";
-import type { BulkItem, CommentFilter, ReviewComment } from "../lib/reviews.shared";
+import type { BulkItem, CommentFilter, ReviewComment, SourceKind } from "../lib/reviews.shared";
+import { SOURCE_KINDS, sourceKind } from "../lib/reviews.shared";
 import { ReviewHeader, Thread, initials, peopleOf } from "../components/review-thread";
 import { BulkUpload } from "../components/bulk-upload";
 import { blockUser, getModeration, isAbusive, isBlocked } from "../lib/moderation.server";
@@ -30,7 +31,9 @@ function filtersFrom(sp: URLSearchParams, shop: string, productId: string): Revi
     status: sp.get("status") || "all",
     rating: sp.get("rating") ? parseInt(sp.get("rating")!, 10) : undefined,
     media: sp.get("media") === "1",
-    customer: sp.get("customer") === "1",
+    // ?customer=1 is the old link for "Customer"
+    source: (sp.get("source") || (sp.get("customer") === "1" ? "customer" : "")) in SOURCE_KINDS
+      ? ((sp.get("source") || "customer") as SourceKind) : undefined,
     flagged: sp.get("flagged") === "1",
     comments: (sp.get("comments") || "") in COMMENT_FILTERS ? (sp.get("comments") as CommentFilter) : undefined,
     from: sp.get("from") || undefined,
@@ -48,18 +51,20 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const sp = new URL(request.url).searchParams;
   const base = { shop: session.shop, productId };
 
-  const [prod, list, counts, customerCount, commentCounts, mod, mediaCount] = await Promise.all([
+  const [prod, list, counts, sourceGroups, commentCounts, mod, mediaCount] = await Promise.all([
     gql(admin, `query($id: ID!) { product(id: $id) { id title handle onlineStoreUrl featuredMedia { preview { image { url } } } } shop { name } }`, {
       id: `gid://shopify/Product/${productId}`,
     }),
     listReviews({ ...filtersFrom(sp, session.shop, productId), page: parseInt(sp.get("page") || "1", 10), sort: (sp.get("sort") as any) || "newest" }),
     prisma.review.groupBy({ by: ["status"], where: base, _count: true }),
-    prisma.review.count({ where: { ...base, source: "Website" } }),
+    prisma.review.groupBy({ by: ["source"], where: base, _count: true }),
     commentFilterCounts(session.shop, productId),
     getModeration(admin, session.shop),
     prisma.review.count({ where: { ...base, hasMedia: true } }),
   ]);
   if (!prod.product) throw new Response("Product not found", { status: 404 });
+  const sourceCounts: Record<SourceKind, number> = { dashboard: 0, customer: 0, import: 0 };
+  sourceGroups.forEach((g: any) => (sourceCounts[sourceKind(g.source)] += g._count));
   const byStatus: Record<string, number> = { published: 0, pending: 0, hidden: 0 };
   counts.forEach((c: any) => (byStatus[c.status] = c._count));
 
@@ -72,7 +77,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     },
     shopName: prod.shop.name as string,
     byStatus,
-    customerCount,
+    sourceCounts,
     mediaCount,
     commentCounts,
     list: {
@@ -254,7 +259,6 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
 /* ───────────────────────── helpers ───────────────────────── */
 type Row = ReturnType<typeof useLoaderData<typeof loader>>["list"]["rows"][number];
 
-const statusTone: Record<string, "success" | "warning" | "neutral"> = { published: "success", pending: "warning", hidden: "neutral" };
 const fmtDate = (iso: string) => new Date(iso).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" });
 const dayStr = (daysAgo: number) => new Date(Date.now() + 5.5 * 3600000 - daysAgo * 86400000).toISOString().slice(0, 10);
 const editUrl = (productId: string, rid: string) => `/app/reviews/${productId}/${encodeURIComponent(rid.split("/").pop() || "")}`;
@@ -295,6 +299,18 @@ const CSS = `
 .rv-chip.alert:not(.on) .n { color: #b42318; opacity: 1; font-weight: 600; }
 .rv-chip .caret { font-size: 9px; opacity: .6; }
 .rv-pick { position: relative; }
+.rv-stat { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
+.rv-stat-pill { position: relative; display: inline-flex; align-items: center; gap: 6px; height: 26px; padding: 0 10px; border-radius: 999px;
+  font-size: 12px; font-weight: 600; cursor: pointer; border: 1px solid transparent; white-space: nowrap; }
+.rv-stat-pill .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.rv-stat-pill .caret { font-size: 9px; opacity: .6; }
+.rv-stat-pill.is-published { background: #cdfee1; color: #0c5132; }
+.rv-stat-pill.is-pending { background: #fff1c2; color: #5e4200; }
+.rv-stat-pill.is-hidden { background: #ebebeb; color: #4a4a4a; }
+.rv-stat-pill:hover { border-color: rgba(0,0,0,.18); }
+.rv-stat-pill.is-busy { opacity: .6; }
+.rv-stat-pill select { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+.rv-stat-date { font-size: 12px; color: #616161; white-space: nowrap; }
 .rv-pick select { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
 .rv-dd { position: relative; }
 .rv-pop { position: fixed; z-index: 1000; display: flex; gap: 0; background: #fff; border: 1px solid #e3e3e3;
@@ -382,6 +398,40 @@ const CSS = `
 .rp-btn[disabled] { opacity: .5; cursor: default; }
 `;
 
+/* ───────────────────────── status + date (click the status to change it) ───────────────────────── */
+const STATUS_LABEL: Record<string, string> = { published: "Published", pending: "Pending", hidden: "Hidden" };
+function StatusCell({ r }: { r: Row }) {
+  const fetcher = useFetcher<typeof action>();
+  const shopify = useAppBridge();
+  const busy = fetcher.state !== "idle";
+  useEffect(() => {
+    const d: any = fetcher.data;
+    if (d?.message) shopify.toast.show(d.message, { isError: d.ok === false });
+  }, [fetcher.data, shopify]);
+  // show the new status straight away while it saves
+  const shown = busy && fetcher.formData ? String(fetcher.formData.get("status")) : r.status;
+  return (
+    <div className="rv-stat">
+      <label className={`rv-stat-pill is-${shown}${busy ? " is-busy" : ""}`} title="Change status">
+        <span className="dot" />
+        {STATUS_LABEL[shown] || shown}
+        <span className="caret">▾</span>
+        <select
+          value={shown}
+          disabled={busy}
+          aria-label={`Status of the review by ${r.author}`}
+          onChange={(e) => fetcher.submit({ id: r.id, intent: "status", status: e.currentTarget.value }, { method: "POST" })}
+        >
+          <option value="published">Published (on the store)</option>
+          <option value="pending">Pending (waiting)</option>
+          <option value="hidden">Hidden (off the store)</option>
+        </select>
+      </label>
+      <div className="rv-stat-date">{fmtDate(r.createdAt)}</div>
+    </div>
+  );
+}
+
 /* ───────────────────────── row actions ───────────────────────── */
 function RowActions({ r, productId }: { r: Row; productId: string }) {
   const fetcher = useFetcher<typeof action>();
@@ -394,27 +444,17 @@ function RowActions({ r, productId }: { r: Row; productId: string }) {
   const send = (data: Record<string, string>) => fetcher.submit({ id: r.id, ...data }, { method: "POST" });
   const menuId = `rv-menu-${String(r.id).replace(/[^A-Za-z0-9_-]/g, "")}`;
 
-  // a pending review keeps one-click Publish; everything else lives in the ⋯ menu
+  // status is changed from the Status column; the rest lives in the ⋯ menu
   return (
     <s-stack direction="inline" gap="small-200" justifyContent="end" alignItems="center">
-      {r.status === "pending" && (
-        <s-button variant="primary" onClick={() => send({ intent: "status", status: "published" })} {...(busy ? { loading: true } : {})}>
-          Publish
-        </s-button>
-      )}
       <s-button
         variant="tertiary"
         icon="menu-horizontal"
         accessibilityLabel={`Actions for the review by ${r.author}`}
         commandFor={menuId}
-        {...(busy && r.status !== "pending" ? { loading: true } : {})}
+        {...(busy ? { loading: true } : {})}
       />
       <s-menu id={menuId} accessibilityLabel="Review actions">
-        {r.status !== "published" ? (
-          <s-button icon="view" onClick={() => send({ intent: "status", status: "published" })}>Publish</s-button>
-        ) : (
-          <s-button icon="hide" onClick={() => send({ intent: "status", status: "hidden" })}>Hide from store</s-button>
-        )}
         <s-button icon={r.featured ? "pin-remove" : "pin"} onClick={() => send({ intent: "pin", featured: String(!r.featured) })}>
           {r.featured ? "Unpin" : "Pin to top"}
         </s-button>
@@ -530,7 +570,7 @@ function ReviewView({
       <div className="rp-facts">
         <span>{verified ? "✓ Verified buyer" : "Not verified"}</span>
         {r.orderId && <span>Order {r.orderId}</span>}
-        <span>Source: {r.source}</span>
+        <span>Source: {SOURCE_KINDS[sourceKind(r.source)]}</span>
         <span>♥ {r.helpful} helpful</span>
         <span>{r.replies} comment{r.replies === 1 ? "" : "s"}{r.pendingComments ? ` · ${r.pendingComments} waiting` : ""}</span>
       </div>
@@ -644,7 +684,7 @@ function DateFilter({ from, to, onApply }: { from: string; to: string; onApply: 
 
 /* ───────────────────────── page ───────────────────────── */
 export default function ProductReviews() {
-  const { product, shopName, byStatus, customerCount, mediaCount, commentCounts, list } = useLoaderData<typeof loader>();
+  const { product, shopName, byStatus, sourceCounts, mediaCount, commentCounts, list } = useLoaderData<typeof loader>();
   const flaggedCount = commentCounts.waiting;
   const needsCount = commentCounts.needs;
   const allCount = byStatus.published + byStatus.pending + byStatus.hidden;
@@ -757,8 +797,8 @@ export default function ProductReviews() {
   const flag = (k: string) => params.get(k) === "1";
   const commentsVal = params.get("comments") || (flag("flagged") ? "waiting" : "");
   const setComments = (v: string) => go({ comments: v || null, flagged: null });
-  const anyFilter = ["q", "rating", "media", "customer", "flagged", "comments", "from", "to"].some((k) => params.get(k));
-  const clearAll = { q: null, rating: null, media: null, customer: null, flagged: null, comments: null, from: null, to: null };
+  const anyFilter = ["q", "rating", "media", "customer", "source", "flagged", "comments", "from", "to"].some((k) => params.get(k));
+  const clearAll = { q: null, rating: null, media: null, customer: null, source: null, flagged: null, comments: null, from: null, to: null };
 
   const tabs: [string, string][] = [
     ["all", `All (${byStatus.published + byStatus.pending + byStatus.hidden})`],
@@ -824,9 +864,23 @@ export default function ProductReviews() {
               <button type="button" className={`rv-chip${flag("media") ? " on" : ""}`} onClick={() => go({ media: flag("media") ? null : "1" })}>
                 🖼 With photos <span className="n">{mediaCount}</span>
               </button>
-              <button type="button" className={`rv-chip${flag("customer") ? " on" : ""}`} onClick={() => go({ customer: flag("customer") ? null : "1" })}>
-                👤 Customer reviews <span className="n">{customerCount}</span>
-              </button>
+              {(() => {
+                const src = (params.get("source") || (params.get("customer") === "1" ? "customer" : "")) as SourceKind | "";
+                const total = sourceCounts.dashboard + sourceCounts.customer + sourceCounts.import;
+                return (
+                  <label className={`rv-chip rv-pick${src ? " on" : ""}`}>
+                    👤 {src ? SOURCE_KINDS[src] : "Source"}
+                    <span className="n">{src ? sourceCounts[src] : total}</span>
+                    <span className="caret">▾</span>
+                    <select value={src} onChange={(e) => go({ source: e.currentTarget.value || null, customer: null })} aria-label="Source filter">
+                      <option value="">All sources ({total})</option>
+                      {(Object.keys(SOURCE_KINDS) as SourceKind[]).map((k) => (
+                        <option key={k} value={k}>{SOURCE_KINDS[k]} ({sourceCounts[k]})</option>
+                      ))}
+                    </select>
+                  </label>
+                );
+              })()}
               <label className={`rv-chip rv-pick${commentsVal ? " on" : ""}`}>
                 💬 {commentsVal ? COMMENT_FILTERS[commentsVal as CommentFilter] : "Comments"}
                 <span className="n">{commentsVal ? commentCounts[commentsVal as CommentFilter] : commentCounts.with}</span>
@@ -914,8 +968,7 @@ export default function ProductReviews() {
             </s-table-header>
             <s-table-header listSlot="primary">Review</s-table-header>
             <s-table-header>Customer</s-table-header>
-            <s-table-header>Status</s-table-header>
-            <s-table-header>Date</s-table-header>
+            <s-table-header>Status · Date</s-table-header>
             <s-table-header format="numeric">Actions</s-table-header>
           </s-table-header-row>
           <s-table-body>
@@ -989,16 +1042,11 @@ export default function ProductReviews() {
                     </div>
                     <s-stack direction="inline" gap="small-300">
                       {r.verified && <s-badge tone="success" icon="check">Verified</s-badge>}
-                      <s-badge>{r.source === "Website" ? "Customer" : r.source}</s-badge>
+                      <s-badge>{SOURCE_KINDS[sourceKind(r.source)]}</s-badge>
                     </s-stack>
                   </s-stack>
                 </s-table-cell>
-                <s-table-cell>
-                  <s-badge tone={statusTone[r.status] || "neutral"}>
-                    {r.status === "published" ? "Published" : r.status === "pending" ? "Pending" : r.status === "hidden" ? "Hidden" : r.status}
-                  </s-badge>
-                </s-table-cell>
-                <s-table-cell>{fmtDate(r.createdAt)}</s-table-cell>
+                <s-table-cell><StatusCell r={r} /></s-table-cell>
                 <s-table-cell><RowActions r={r} productId={product.id} /></s-table-cell>
               </s-table-row>
             ))}

@@ -15,6 +15,7 @@ export const SUMMARY_KEY = "summary";
 export const VOTES_NS = "vw_reviews";
 export const VOTES_KEY = "votes";
 import { SOURCES, STATUSES, countComments, normalizeComments } from "./reviews.shared";
+import type { SourceKind } from "./reviews.shared";
 import type { BulkComment, BulkItem, CommentFilter, ReviewComment } from "./reviews.shared";
 export { SOURCES, STATUSES, countComments, normalizeComments };
 export type { ReviewComment };
@@ -935,6 +936,7 @@ export async function listComments(opts: { shop: string; productId?: string; nee
 export type ReviewFilters = {
   shop: string; productId: string; status?: string; rating?: number; media?: boolean; q?: string;
   customer?: boolean;               // written by shoppers in the widget (not added/imported by the store)
+  source?: SourceKind;              // dashboard (added in the app) | customer (widget) | import (bulk upload)
   from?: string; to?: string;       // YYYY-MM-DD, inclusive (India time)
   flagged?: boolean;                // has comments waiting for approval (same as comments: "waiting")
   comments?: CommentFilter;
@@ -959,7 +961,9 @@ function reviewWhere(opts: ReviewFilters) {
   if (opts.status && opts.status !== "all") where.status = opts.status;
   if (opts.rating) where.rating = opts.rating;
   if (opts.media) where.hasMedia = true;
-  if (opts.customer) where.source = "Website";
+  if (opts.customer || opts.source === "customer") where.source = "Website";
+  else if (opts.source === "import") where.source = "Import";
+  else if (opts.source === "dashboard") where.source = { notIn: ["Website", "Import"] };
   const and = commentWhere(opts.flagged ? "waiting" : opts.comments);
   if (and.length) where.AND = and;
   const day = (s: string | undefined, end: boolean) =>

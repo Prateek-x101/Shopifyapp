@@ -529,7 +529,7 @@ function Composer({
                   max={localInput(new Date())}
                   onChange={(e) => setWhen(e.currentTarget.value)}
                 />
-                <button type="button" className="cv-when-chip" onClick={() => { setWhen(""); setPickWhen(false); }}>Now</button>
+                <button type="button" className="cv-when-chip" onClick={() => { setWhen(""); setPickWhen(false); }}>Use current time</button>
               </>
             ) : (
               <button
@@ -538,7 +538,7 @@ function Composer({
                 title="Post with an earlier date"
                 onClick={() => { setPickWhen(true); setWhen(localInput(new Date())); }}
               >
-                📅 Now
+                📅 Posting time: now · change
               </button>
             )}
           </div>

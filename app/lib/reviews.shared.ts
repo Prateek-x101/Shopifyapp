@@ -2,6 +2,13 @@
 export const STATUSES = ["pending", "published", "hidden"] as const;
 export const SOURCES = ["Website", "WhatsApp", "Instagram", "Email", "Import"] as const;
 
+/** Where a review came from, in the 3 groups the admin shows: added in the app, written by a shopper, bulk uploaded */
+export type SourceKind = "dashboard" | "customer" | "import";
+export const SOURCE_KINDS: Record<SourceKind, string> = { dashboard: "Dashboard", customer: "Customer", import: "Imported" };
+export function sourceKind(source?: string | null): SourceKind {
+  return source === "Website" ? "customer" : source === "Import" ? "import" : "dashboard";
+}
+
 /** Comment thread node (same shape the storefront review widget uses). Top level = comment, nested = reply. */
 export type ReviewComment = {
   id: string;
