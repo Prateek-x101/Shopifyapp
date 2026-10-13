@@ -94,7 +94,8 @@ export const CV_CSS = `
 .cv-kids .cv-kids { margin-left: 12px; }
 
 .cv-edit { margin-top: 8px; display: grid; gap: 8px; padding: 12px; border: 1px solid #efefef; border-radius: 10px; background: #fcfcfc; }
-.cv-edit-row { display: grid; grid-template-columns: 1fr 96px; gap: 8px; }
+.cv-edit-row { display: grid; grid-template-columns: 1fr 96px 190px; gap: 8px; }
+@media (max-width: 640px) { .cv-edit-row { grid-template-columns: 1fr 96px; } }
 .cv-label { display: block; font-size: 11px; color: #8a8a8a; margin-bottom: 4px; }
 .cv-input, .cv-textarea { width: 100%; box-sizing: border-box; border: 1px solid #e3e3e3; border-radius: 8px;
   padding: 7px 10px; font: inherit; font-size: 13px; background: #fff; color: #1f1f1f; }
@@ -128,6 +129,13 @@ export const CV_CSS = `
 .cv-new .cv-input { flex: 1; }
 .cv-file { font-size: 12px; color: #707070; max-width: 190px; }
 .cv-hint { margin-top: 6px; font-size: 11px; color: #b0b0b0; text-align: right; }
+.cv-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 6px; }
+.cv-foot .cv-hint { margin-top: 0; }
+.cv-when { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: #616161; }
+.cv-when-chip { border: 1px solid #e3e3e3; background: #fff; border-radius: 999px; padding: 3px 10px; font: inherit; font-size: 12px; color: #303030; cursor: pointer; }
+.cv-when-chip:hover { background: #f6f6f6; }
+.cv-when-chip.on { border-color: #303030; }
+.cv-when input { border: 1px solid #d0d0d0; border-radius: 8px; padding: 3px 8px; font: inherit; font-size: 12px; }
 .cv-empty { padding: 26px 0 12px; text-align: center; color: #9a9a9a; font-size: 13px; }
 
 /* right-column summary */
@@ -281,11 +289,21 @@ function Likes({ id, count }: { id: string; count: number }) {
   );
 }
 
+/** "YYYY-MM-DDTHH:mm" on the admin's own clock, for <input type="datetime-local"> */
+function localInput(d: Date) {
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+const fullWhen = (iso: string) =>
+  new Date(iso).toLocaleString("en-IN", { day: "numeric", month: "short", year: "numeric", hour: "numeric", minute: "2-digit" });
+
 function Node({ node, depth, onReply, activeId }: { node: ReviewComment; depth: number; onReply: (n: ReviewComment) => void; activeId?: string }) {
   const fetcher = useFetcher<any>();
   const actionUrl = useContext(ActionUrl);
   const shopify = useAppBridge();
   const [editing, setEditing] = useState(false);
+  const origWhen = localInput(new Date(node.date));
+  const [editWhen, setEditWhen] = useState(origWhen);
   const busy = fetcher.state !== "idle";
   const hidden = node.status === "hidden";
   const pending = node.status === "pending";
@@ -310,20 +328,32 @@ function Node({ node, depth, onReply, activeId }: { node: ReviewComment; depth: 
             {store && <span className="cv-tag">· Store</span>}
             {hidden && <span className="cv-tag hidden">· Hidden</span>}
             {pending && <span className="cv-tag pending">· Waiting for approval</span>}
-            <span>· {when}</span>
+            <span title={fullWhen(node.date)}>· {when}</span>
           </div>
 
           {editing ? (
             <fetcher.Form method="post" action={actionUrl} className="cv-edit">
               <input type="hidden" name="intent" value="comment-edit" />
               <input type="hidden" name="commentId" value={node.id} />
+              {/* only sent when changed, so saving the text doesn't move the time */}
+              <input type="hidden" name="date" value={editWhen && editWhen !== origWhen ? new Date(editWhen).toISOString() : ""} />
               <div className="cv-edit-row">
                 <label><span className="cv-label">Name</span><input className="cv-input" name="name" defaultValue={node.name} /></label>
                 <label><span className="cv-label">Likes</span><input className="cv-input" name="likes" type="number" min={0} max={99999} defaultValue={node.likeCount || 0} /></label>
+                <label>
+                  <span className="cv-label">Date &amp; time</span>
+                  <input
+                    className="cv-input"
+                    type="datetime-local"
+                    value={editWhen}
+                    max={localInput(new Date())}
+                    onChange={(e) => setEditWhen(e.currentTarget.value)}
+                  />
+                </label>
               </div>
               <label><span className="cv-label">Message</span><textarea className="cv-textarea" name="text" defaultValue={node.text} /></label>
               <div className="cv-btns">
-                <button className="cv-btn ghost" type="button" onClick={() => setEditing(false)}>Cancel</button>
+                <button className="cv-btn ghost" type="button" onClick={() => { setEditing(false); setEditWhen(origWhen); }}>Cancel</button>
                 <button className="cv-btn" type="submit" disabled={busy}>{busy ? "Saving…" : "Save"}</button>
               </div>
             </fetcher.Form>
@@ -340,7 +370,7 @@ function Node({ node, depth, onReply, activeId }: { node: ReviewComment; depth: 
               )}
               <Likes id={node.id} count={node.likeCount} />
               <button type="button" className={`cv-act${activeId === node.id ? " on" : ""}`} onClick={() => onReply(node)}>Reply</button>
-              <button type="button" className="cv-act" onClick={() => setEditing(true)}>Edit</button>
+              <button type="button" className="cv-act" onClick={() => { setEditWhen(origWhen); setEditing(true); }}>Edit</button>
               {!pending && (
                 <button type="button" className="cv-act" disabled={busy} onClick={() => send({ intent: "comment-status", status: hidden ? "approved" : "hidden" })}>
                   {hidden ? "Show" : "Hide"}
@@ -394,6 +424,8 @@ function Composer({
   const [as, setAs] = useState<string>("store");
   const [newPic, setNewPic] = useState<string>("");
   const [text, setText] = useState("");
+  const [when, setWhen] = useState(""); // "" = now
+  const [pickWhen, setPickWhen] = useState(false);
   const busy = fetcher.state !== "idle";
   const person = as.startsWith("person:") ? people.find((p) => `person:${p.name}` === as) : null;
   const asName = as === "store" ? shopName : as === "new" ? "New person" : as.slice(7);
@@ -407,6 +439,8 @@ function Composer({
       formRef.current?.reset();
       setText("");
       setNewPic("");
+      setWhen("");
+      setPickWhen(false);
       if (msgRef.current) msgRef.current.style.height = "";
       onDone();
     }
@@ -420,6 +454,7 @@ function Composer({
         <input type="hidden" name="shopName" value={shopName} />
         <input type="hidden" name="replyAs" value={as} />
         <input type="hidden" name="personAvatar" value={person?.avatar || ""} />
+        <input type="hidden" name="date" value={when ? new Date(when).toISOString() : ""} />
 
         {target && (
           <div className="cv-target">
@@ -482,7 +517,33 @@ function Composer({
             <svg viewBox="0 0 24 24"><path d="M2.01 21 23 12 2.01 3 2 10l15 2-15 2z" /></svg>
           </button>
         </div>
-        <div className="cv-hint">Enter to send · Shift + Enter for a new line</div>
+        <div className="cv-foot">
+          <div className="cv-when">
+            {pickWhen ? (
+              <>
+                <span>📅</span>
+                <input
+                  type="datetime-local"
+                  aria-label="Date and time of this comment"
+                  value={when}
+                  max={localInput(new Date())}
+                  onChange={(e) => setWhen(e.currentTarget.value)}
+                />
+                <button type="button" className="cv-when-chip" onClick={() => { setWhen(""); setPickWhen(false); }}>Now</button>
+              </>
+            ) : (
+              <button
+                type="button"
+                className="cv-when-chip"
+                title="Post with an earlier date"
+                onClick={() => { setPickWhen(true); setWhen(localInput(new Date())); }}
+              >
+                📅 Now
+              </button>
+            )}
+          </div>
+          <div className="cv-hint">Enter to send · Shift + Enter for a new line</div>
+        </div>
       </fetcher.Form>
     </div>
   );

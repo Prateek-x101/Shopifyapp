@@ -392,31 +392,41 @@ function RowActions({ r, productId }: { r: Row; productId: string }) {
     if (d?.message) shopify.toast.show(d.message, { isError: d.ok === false });
   }, [fetcher.data, shopify]);
   const send = (data: Record<string, string>) => fetcher.submit({ id: r.id, ...data }, { method: "POST" });
+  const menuId = `rv-menu-${String(r.id).replace(/[^A-Za-z0-9_-]/g, "")}`;
 
+  // a pending review keeps one-click Publish; everything else lives in the ⋯ menu
   return (
-    <s-stack direction="inline" gap="small-200" justifyContent="end">
-      {r.status !== "published" ? (
+    <s-stack direction="inline" gap="small-200" justifyContent="end" alignItems="center">
+      {r.status === "pending" && (
         <s-button variant="primary" onClick={() => send({ intent: "status", status: "published" })} {...(busy ? { loading: true } : {})}>
           Publish
         </s-button>
-      ) : (
-        <s-button onClick={() => send({ intent: "status", status: "hidden" })} {...(busy ? { disabled: true } : {})}>Hide</s-button>
       )}
       <s-button
         variant="tertiary"
-        icon="pin"
-        tone={r.featured ? "auto" : undefined}
-        accessibilityLabel={r.featured ? "Unpin" : "Pin to top"}
-        onClick={() => send({ intent: "pin", featured: String(!r.featured) })}
+        icon="menu-horizontal"
+        accessibilityLabel={`Actions for the review by ${r.author}`}
+        commandFor={menuId}
+        {...(busy && r.status !== "pending" ? { loading: true } : {})}
       />
-      <s-button variant="tertiary" icon="edit" accessibilityLabel="Edit" href={editUrl(productId, r.id)} />
-      <s-button
-        variant="tertiary"
-        tone="critical"
-        icon="delete"
-        accessibilityLabel="Delete"
-        onClick={() => { if (confirm("Delete this review permanently?")) send({ intent: "delete" }); }}
-      />
+      <s-menu id={menuId} accessibilityLabel="Review actions">
+        {r.status !== "published" ? (
+          <s-button icon="view" onClick={() => send({ intent: "status", status: "published" })}>Publish</s-button>
+        ) : (
+          <s-button icon="hide" onClick={() => send({ intent: "status", status: "hidden" })}>Hide from store</s-button>
+        )}
+        <s-button icon={r.featured ? "pin-remove" : "pin"} onClick={() => send({ intent: "pin", featured: String(!r.featured) })}>
+          {r.featured ? "Unpin" : "Pin to top"}
+        </s-button>
+        <s-button icon="edit" href={editUrl(productId, r.id)}>Edit review</s-button>
+        <s-button
+          icon="delete"
+          tone="critical"
+          onClick={() => { if (confirm("Delete this review permanently?")) send({ intent: "delete" }); }}
+        >
+          Delete
+        </s-button>
+      </s-menu>
     </s-stack>
   );
 }
@@ -983,7 +993,11 @@ export default function ProductReviews() {
                     </s-stack>
                   </s-stack>
                 </s-table-cell>
-                <s-table-cell><s-badge tone={statusTone[r.status] || "neutral"}>{r.status}</s-badge></s-table-cell>
+                <s-table-cell>
+                  <s-badge tone={statusTone[r.status] || "neutral"}>
+                    {r.status === "published" ? "Published" : r.status === "pending" ? "Pending" : r.status === "hidden" ? "Hidden" : r.status}
+                  </s-badge>
+                </s-table-cell>
                 <s-table-cell>{fmtDate(r.createdAt)}</s-table-cell>
                 <s-table-cell><RowActions r={r} productId={product.id} /></s-table-cell>
               </s-table-row>

@@ -595,6 +595,20 @@ function removeNode(list: ReviewComment[], id: string): boolean {
   return list.some((c) => removeNode(c.replies || [], id));
 }
 
+/**
+ * A comment date picked in the admin: not in the future and not before the review itself.
+ * Throws a readable message for the toast.
+ */
+export function commentDate(value: string, reviewDate: Date) {
+  const t = Date.parse(value);
+  if (!Number.isFinite(t)) throw new Error("That date isn't valid");
+  if (t > Date.now() + 5 * 60 * 1000) throw new Error("The date can't be in the future");
+  if (t < new Date(reviewDate).getTime() - 60 * 1000) {
+    throw new Error(`The date can't be before the review (${new Date(reviewDate).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" })})`);
+  }
+  return new Date(t).toISOString();
+}
+
 /** Add a comment on a review (parentId = null) or a reply under a comment/reply. */
 export async function addComment(
   admin: Admin,
@@ -602,19 +616,20 @@ export async function addComment(
   reviewId: string,
   input: {
     name: string; text: string; type: "store" | "customer"; customerId?: string | null; verified?: boolean; id?: string;
-    avatar?: string | null; status?: "approved" | "pending";
+    avatar?: string | null; status?: "approved" | "pending"; date?: string | null;
   },
   parentId: string | null = null,
 ) {
   const cur = await prisma.review.findUnique({ where: { id: reviewId } });
   if (!cur || cur.shop !== shop) throw new Error("Review not found");
   const tree = normalizeComments(JSON.parse(cur.replies));
+  const date = input.date ? commentDate(input.date, cur.createdAt) : new Date().toISOString();
   const safeId = input.id && /^[A-Za-z0-9_-]{3,40}$/.test(input.id) && !findNode(tree, input.id) ? input.id : null;
   const node: ReviewComment = {
     id: safeId || `c_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
     name: input.name.slice(0, 60),
     text: input.text.slice(0, 2000),
-    date: new Date().toISOString(),
+    date,
     type: input.type,
     status: input.status || "approved",
     customerId: input.customerId || null,
@@ -665,7 +680,7 @@ export async function updateComment(
   shop: string,
   reviewId: string,
   commentId: string,
-  patch: { text?: string; name?: string; avatar?: string | null; status?: "approved" | "hidden"; likeCount?: number },
+  patch: { text?: string; name?: string; avatar?: string | null; status?: "approved" | "hidden"; likeCount?: number; date?: string },
 ) {
   const cur = await prisma.review.findUnique({ where: { id: reviewId } });
   if (!cur || cur.shop !== shop) throw new Error("Review not found");
@@ -677,6 +692,7 @@ export async function updateComment(
   if (patch.avatar !== undefined) node.avatar = patch.avatar;
   if (patch.status) node.status = patch.status;
   if (patch.likeCount !== undefined && Number.isFinite(patch.likeCount)) node.likeCount = Math.max(0, Math.min(99999, Math.round(patch.likeCount)));
+  if (patch.date) node.date = commentDate(patch.date, cur.createdAt);
   await patchReview(admin, shop, reviewId, { replies: tree });
   return node;
 }

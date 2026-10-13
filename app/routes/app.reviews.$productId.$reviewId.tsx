@@ -80,15 +80,25 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
         try { avatar = (await uploadImages(admin, [pic]))[0]?.url || null; } catch { return { ok: false, message: "Picture upload failed" }; }
       }
     }
-    await addComment(admin, session.shop, id, { name, text, type, avatar }, parentId);
+    const date = String(fd.get("date") || "") || null;
+    try {
+      await addComment(admin, session.shop, id, { name, text, type, avatar, date }, parentId);
+    } catch (e: any) {
+      return { ok: false, message: e?.message || "Couldn't post it" };
+    }
     return { ok: true, message: parentId ? `Reply posted as ${name}` : `Comment posted as ${name}` };
   }
   if (intent === "comment-edit") {
-    await updateComment(admin, session.shop, id, String(fd.get("commentId")), {
-      text: String(fd.get("text") || ""),
-      name: String(fd.get("name") || ""),
-      ...(fd.has("likes") ? { likeCount: parseInt(String(fd.get("likes") || "0"), 10) || 0 } : {}),
-    });
+    try {
+      await updateComment(admin, session.shop, id, String(fd.get("commentId")), {
+        text: String(fd.get("text") || ""),
+        name: String(fd.get("name") || ""),
+        ...(fd.has("likes") ? { likeCount: parseInt(String(fd.get("likes") || "0"), 10) || 0 } : {}),
+        ...(fd.get("date") ? { date: String(fd.get("date")) } : {}),
+      });
+    } catch (e: any) {
+      return { ok: false, message: e?.message || "Couldn't save it" };
+    }
     return { ok: true, message: "Comment updated" };
   }
   if (intent === "comment-likes") {
