@@ -1,12 +1,14 @@
 /** Values used by both the server and the admin UI (safe to ship to the browser). */
 export const STATUSES = ["pending", "published", "hidden"] as const;
-export const SOURCES = ["Website", "WhatsApp", "Instagram", "Email", "Import"] as const;
+export const SOURCES = ["Website", "WhatsApp", "Instagram", "Email", "Import", "Test"] as const;
+/** Test reviews (AI test data): always hidden, never on the store; delete them all from the product page. */
+export const TEST_SOURCE = "Test";
 
 /** Where a review came from, in the 3 groups the admin shows: added in the app, written by a shopper, bulk uploaded */
-export type SourceKind = "dashboard" | "customer" | "import";
-export const SOURCE_KINDS: Record<SourceKind, string> = { dashboard: "Dashboard", customer: "Customer", import: "Imported" };
+export type SourceKind = "dashboard" | "customer" | "import" | "test";
+export const SOURCE_KINDS: Record<SourceKind, string> = { dashboard: "Dashboard", customer: "Customer", import: "Imported", test: "Test" };
 export function sourceKind(source?: string | null): SourceKind {
-  return source === "Website" ? "customer" : source === "Import" ? "import" : "dashboard";
+  return source === "Website" ? "customer" : source === "Import" ? "import" : source === "Test" ? "test" : "dashboard";
 }
 
 /** Comment thread node (same shape the storefront review widget uses). Top level = comment, nested = reply. */

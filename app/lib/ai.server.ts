@@ -6,7 +6,9 @@
  *   - writes / polishes replies AS THE STORE in a review's conversation (the admin checks and sends)
  *   - turns a real customer's message or chat screenshot into a review draft, in the customer's own words
  *   - sums up a product's reviews for the admin (likes, complaints, sizing, open questions)
- * It never writes reviews, comments or replies in a customer's name.
+ *   - makes TEST reviews (with comments) for trying out the widget: they are saved with source "Test",
+ *     always hidden, never on the store, and deleted together (see guardTest in reviews.server.ts)
+ * It never writes published reviews, comments or replies in a customer's name.
  */
 import crypto from "node:crypto";
 import prisma from "../db.server";
@@ -144,6 +146,10 @@ async function gemini(
     clearTimeout(timer);
   }
   const body: any = await res.json().catch(() => ({}));
+  // older models allow fewer output tokens: try once more with their limit
+  if (res.status === 400 && (opts.maxTokens || 0) > 8192 && /output.?tokens/i.test(String(body?.error?.message || ""))) {
+    return gemini(shop, { ...opts, maxTokens: 8192 });
+  }
   if (!res.ok) throw new AiError(friendlyError(res.status, body, pub.model));
   if (body?.promptFeedback?.blockReason) throw new AiError("Gemini refused this text (safety filter). Edit it and try again.");
   const cand = body?.candidates?.[0];
@@ -275,6 +281,62 @@ export async function draftFromCustomerMessage(
     body: body.slice(0, 4000),
     notes: (Array.isArray(raw.notes) ? raw.notes : []).map((n: any) => String(n).slice(0, 200)).slice(0, 6),
   };
+}
+
+/* ───────────────────────── 4 · test data (hidden, labelled "Test") ───────────────────────── */
+export type TestComment = { name: string; store: boolean; text: string; replies: TestComment[] };
+export type TestReview = { author: string; city: string; rating: number; body: string; daysAgo: number; comments: TestComment[] };
+
+export async function generateTestReviews(
+  shop: string,
+  input: { productTitle: string; productText: string; count: number; mix: string; language: string; withComments: boolean },
+): Promise<TestReview[]> {
+  const count = Math.max(1, Math.min(30, Math.round(input.count)));
+  const mix =
+    input.mix === "positive" ? "mostly 5 and 4 stars, a few 3"
+      : input.mix === "mixed" ? "a real mix: about half 4–5 stars, the rest 1–3 stars with clear complaints (size, delivery, quality)"
+      : "realistic: about 60% 5 stars, 25% 4 stars, 10% 3 stars, 5% 1–2 stars";
+  const lang =
+    input.language === "english" ? "English" : input.language === "hinglish" ? "Hinglish (Hindi in English letters)" : "a mix of English and Hinglish";
+  const system = [
+    "You create TEST DATA for software testing of an e-commerce review widget. The entries are saved hidden and labelled TEST; they are never shown to shoppers.",
+    "Make the entries varied so the widget's features get exercised: short and long texts (some over 300 characters), different star ratings, Indian names and cities, some with typos or emojis, different topics (fit, fabric, colour, delivery, packaging, price).",
+    input.withComments
+      ? "About half of the entries get a comment thread: shoppers asking questions (size, washing, delivery), the store answering (store: true), and sometimes a reply under a reply. Up to 3 comments per entry, replies nested at most 2 levels."
+      : "No comments: every comments list is empty.",
+    `Language: ${lang}. Star ratings: ${mix}. daysAgo: a whole number 1–120, spread out.`,
+    'Answer as JSON: {"reviews":[{"author":string,"city":string,"rating":1-5,"body":string,"daysAgo":number,"comments":[{"name":string,"store":boolean,"text":string,"replies":[...same shape]}]}]}',
+  ].join("\n");
+  const raw = parseJson<any>(await gemini(shop, {
+    system,
+    parts: [{ text: `Product: ${input.productTitle}\n${input.productText ? `About the product: ${input.productText.slice(0, 1500)}\n` : ""}Create ${count} test entries.` }],
+    json: true,
+    temperature: 1,
+    maxTokens: 24000,
+  }));
+  const clean = (c: any, depth: number): TestComment | null => {
+    const text = String(c?.text || "").trim();
+    if (!text) return null;
+    return {
+      name: String(c?.name || "Shopper").trim().slice(0, 60),
+      store: !!c?.store,
+      text: text.slice(0, 1000),
+      replies: depth < 2 ? (Array.isArray(c?.replies) ? c.replies : []).map((x: any) => clean(x, depth + 1)).filter(Boolean).slice(0, 3) as TestComment[] : [],
+    };
+  };
+  const list: TestReview[] = (Array.isArray(raw?.reviews) ? raw.reviews : [])
+    .map((r: any) => ({
+      author: String(r?.author || "").trim().slice(0, 60) || "Test shopper",
+      city: String(r?.city || "").trim().slice(0, 60),
+      rating: Math.max(1, Math.min(5, Math.round(Number(r?.rating) || 5))),
+      body: String(r?.body || "").trim().slice(0, 3000),
+      daysAgo: Math.max(1, Math.min(365, Math.round(Number(r?.daysAgo) || 7))),
+      comments: input.withComments ? (Array.isArray(r?.comments) ? r.comments : []).map((c: any) => clean(c, 0)).filter(Boolean).slice(0, 3) : [],
+    }))
+    .filter((r: TestReview) => r.body)
+    .slice(0, count);
+  if (!list.length) throw new AiError("Gemini didn't return any test reviews. Try again.");
+  return list;
 }
 
 /* ───────────────────────── 3 · what customers say (admin summary) ───────────────────────── */

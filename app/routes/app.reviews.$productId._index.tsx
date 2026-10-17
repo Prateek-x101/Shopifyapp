@@ -63,7 +63,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     prisma.review.count({ where: { ...base, hasMedia: true } }),
   ]);
   if (!prod.product) throw new Response("Product not found", { status: 404 });
-  const sourceCounts: Record<SourceKind, number> = { dashboard: 0, customer: 0, import: 0 };
+  const sourceCounts: Record<SourceKind, number> = { dashboard: 0, customer: 0, import: 0, test: 0 };
   sourceGroups.forEach((g: any) => (sourceCounts[sourceKind(g.source)] += g._count));
   const byStatus: Record<string, number> = { published: 0, pending: 0, hidden: 0 };
   counts.forEach((c: any) => (byStatus[c.status] = c._count));
@@ -398,6 +398,63 @@ const CSS = `
 .rp-btn[disabled] { opacity: .5; cursor: default; }
 `;
 
+/* ───────────────────────── 🧪 test reviews: AI test data that never reaches the store ───────────────────────── */
+function TestReviews({ productId, count }: { productId: string; count: number }) {
+  const gen = useFetcher<any>();
+  const del = useFetcher<any>();
+  const shopify = useAppBridge();
+  const [n, setN] = useState("10");
+  const [mix, setMix] = useState("realistic");
+  const [lang, setLang] = useState("mixed");
+  const [withComments, setWithComments] = useState(true);
+  useEffect(() => { const d: any = gen.data; if (d?.message) shopify.toast.show(d.message, { isError: !d.ok }); }, [gen.data, shopify]);
+  useEffect(() => { const d: any = del.data; if (d?.message) shopify.toast.show(d.message, { isError: !d.ok }); }, [del.data, shopify]);
+  const making = gen.state !== "idle";
+  return (
+    <s-stack gap="base">
+      <s-banner tone="warning">
+        For testing the widget only. Test reviews are always <b>hidden</b>, marked “🧪 Test”, and can't be published, pinned or put in the banner,
+        so shoppers never see them. Delete them all with one click when you're done.
+      </s-banner>
+      <s-grid gridTemplateColumns="1fr 1fr" gap="base">
+        <s-select label="How many" value={n} onChange={(e: any) => setN(e.currentTarget.value)}>
+          {["5", "10", "20", "30"].map((x) => <s-option key={x} value={x}>{x}</s-option>)}
+        </s-select>
+        <s-select label="Stars" value={mix} onChange={(e: any) => setMix(e.currentTarget.value)}>
+          <s-option value="realistic">Realistic spread</s-option>
+          <s-option value="positive">Mostly 4–5 stars</s-option>
+          <s-option value="mixed">Mixed, with complaints</s-option>
+        </s-select>
+        <s-select label="Language" value={lang} onChange={(e: any) => setLang(e.currentTarget.value)}>
+          <s-option value="mixed">English + Hinglish</s-option>
+          <s-option value="english">English</s-option>
+          <s-option value="hinglish">Hinglish</s-option>
+        </s-select>
+        <s-checkbox label="With comments and replies" checked={withComments} onChange={(e: any) => setWithComments(!!e.currentTarget.checked)} />
+      </s-grid>
+      <s-stack direction="inline" gap="small-200" justifyContent="space-between" alignItems="center">
+        <s-button
+          tone="critical"
+          variant="secondary"
+          disabled={!count || del.state !== "idle"}
+          onClick={() => { if (confirm(`Delete all ${count} test reviews of this product?`)) del.submit({ intent: "test-delete", productId }, { method: "POST", action: "/app/ai" }); }}
+          {...(del.state !== "idle" ? { loading: true } : {})}
+        >
+          Delete all test reviews ({count})
+        </s-button>
+        <s-button
+          variant="primary"
+          onClick={() => gen.submit({ intent: "test-generate", productId, count: n, mix, language: lang, comments: String(withComments) }, { method: "POST", action: "/app/ai" })}
+          {...(making ? { loading: true } : {})}
+        >
+          ✨ Make test reviews
+        </s-button>
+      </s-stack>
+      {making && <s-text color="subdued">Gemini is writing them… this can take up to a minute.</s-text>}
+    </s-stack>
+  );
+}
+
 /* ───────────────────────── ✨ AI insights: what customers say about this product ───────────────────────── */
 function AiInsights({ data, busy }: { data: any; busy: boolean }) {
   if (busy) {
@@ -457,6 +514,14 @@ function StatusCell({ r }: { r: Row }) {
   }, [fetcher.data, shopify]);
   // show the new status straight away while it saves
   const shown = busy && fetcher.formData ? String(fetcher.formData.get("status")) : r.status;
+  if (sourceKind(r.source) === "test") {
+    return (
+      <div className="rv-stat">
+        <span className="rv-stat-pill is-hidden" title="Test reviews always stay hidden"><span className="dot" />Hidden · test</span>
+        <div className="rv-stat-date">{fmtDate(r.createdAt)}</div>
+      </div>
+    );
+  }
   return (
     <div className="rv-stat">
       <label className={`rv-stat-pill is-${shown}${busy ? " is-busy" : ""}`} title="Change status">
@@ -869,6 +934,9 @@ export default function ProductReviews() {
         AI insights
       </s-button>
       <s-button slot="secondary-actions" icon="upload" commandFor="bulk-modal" command="--show">Bulk upload</s-button>
+      <s-button slot="secondary-actions" icon="wrench" commandFor="test-reviews-modal" command="--show">
+        Test reviews{sourceCounts.test ? ` (${sourceCounts.test})` : ""}
+      </s-button>
       <s-button slot="secondary-actions" icon="export" onClick={() => runExport(true)} {...(exportBusy ? { loading: true } : {})}>
         Export{anyFilter || status !== "all" ? " filtered" : ""}
       </s-button>
@@ -923,7 +991,7 @@ export default function ProductReviews() {
               </button>
               {(() => {
                 const src = (params.get("source") || (params.get("customer") === "1" ? "customer" : "")) as SourceKind | "";
-                const total = sourceCounts.dashboard + sourceCounts.customer + sourceCounts.import;
+                const total = sourceCounts.dashboard + sourceCounts.customer + sourceCounts.import + sourceCounts.test;
                 return (
                   <label className={`rv-chip rv-pick${src ? " on" : ""}`}>
                     👤 {src ? SOURCE_KINDS[src] : "Source"}
@@ -931,7 +999,7 @@ export default function ProductReviews() {
                     <span className="caret">▾</span>
                     <select value={src} onChange={(e) => go({ source: e.currentTarget.value || null, customer: null })} aria-label="Source filter">
                       <option value="">All sources ({total})</option>
-                      {(Object.keys(SOURCE_KINDS) as SourceKind[]).map((k) => (
+                      {(Object.keys(SOURCE_KINDS) as SourceKind[]).filter((k) => k !== "test" || sourceCounts.test > 0).map((k) => (
                         <option key={k} value={k}>{SOURCE_KINDS[k]} ({sourceCounts[k]})</option>
                       ))}
                     </select>
@@ -1099,7 +1167,9 @@ export default function ProductReviews() {
                     </div>
                     <s-stack direction="inline" gap="small-300">
                       {r.verified && <s-badge tone="success" icon="check">Verified</s-badge>}
-                      <s-badge>{SOURCE_KINDS[sourceKind(r.source)]}</s-badge>
+                      {sourceKind(r.source) === "test"
+                        ? <s-badge tone="warning">🧪 Test · not on store</s-badge>
+                        : <s-badge>{SOURCE_KINDS[sourceKind(r.source)]}</s-badge>}
                     </s-stack>
                   </s-stack>
                 </s-table-cell>
@@ -1141,6 +1211,12 @@ export default function ProductReviews() {
             onConversation={() => openThread(viewRow.id)}
           />
         )}
+      </s-modal>
+
+      {/* 🧪 test reviews (AI test data, hidden) */}
+      <s-modal id="test-reviews-modal" heading="🧪 Test reviews" size="base">
+        <TestReviews productId={product.id} count={sourceCounts.test} />
+        <s-button slot="primary-action" commandFor="test-reviews-modal" command="--hide">Close</s-button>
       </s-modal>
 
       {/* ✨ AI insights */}

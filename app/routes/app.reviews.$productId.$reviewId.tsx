@@ -294,6 +294,9 @@ export default function EditReview() {
       <s-link slot="breadcrumb-actions" href={`/app/reviews/${productId}`}>{productTitle}</s-link>
 
       {isNew && <AiFromMessage productId={productId} onName={setAuthorName} />}
+      {r.source === "Test" && (
+        <s-banner tone="warning">🧪 This is a test review. It always stays hidden and never shows on the store, whatever you choose below.</s-banner>
+      )}
 
       <Form method="post" encType="multipart/form-data" id="review-form">
         <input type="hidden" name="intent" value="save" />

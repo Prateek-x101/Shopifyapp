@@ -14,7 +14,7 @@ export const SUMMARY_NS = "vw_reviews";
 export const SUMMARY_KEY = "summary";
 export const VOTES_NS = "vw_reviews";
 export const VOTES_KEY = "votes";
-import { SOURCES, STATUSES, countComments, normalizeComments } from "./reviews.shared";
+import { SOURCES, STATUSES, TEST_SOURCE, countComments, normalizeComments } from "./reviews.shared";
 import type { SourceKind } from "./reviews.shared";
 import type { BulkComment, BulkItem, CommentFilter, ReviewComment } from "./reviews.shared";
 export { SOURCES, STATUSES, countComments, normalizeComments };
@@ -93,8 +93,18 @@ export async function ensureDefinitions(admin: Admin) {
   }
 
   // fields added after the first version
-  const def = await gql(admin, `{ metaobjectDefinitionByType(type: "${REVIEW_TYPE}") { id fieldDefinitions { key } } }`);
+  const def = await gql(admin, `{ metaobjectDefinitionByType(type: "${REVIEW_TYPE}") { id fieldDefinitions { key validations { name value } } } }`);
   const keys = new Set((def.metaobjectDefinitionByType?.fieldDefinitions || []).map((f: any) => f.key));
+  // sources added later (e.g. "Test") must be allowed by the definition's choices
+  const srcDef = (def.metaobjectDefinitionByType?.fieldDefinitions || []).find((f: any) => f.key === "source");
+  const srcChoices = String(srcDef?.validations?.find((v: any) => v.name === "choices")?.value || "");
+  if (def.metaobjectDefinitionByType && srcChoices && SOURCES.some((x) => !srcChoices.includes(`"${x}"`))) {
+    await gql(admin, `mutation($id: ID!, $d: MetaobjectDefinitionUpdateInput!) {
+      metaobjectDefinitionUpdate(id: $id, definition: $d) { metaobjectDefinition { id } userErrors { message } } }`, {
+      id: def.metaobjectDefinitionByType.id,
+      d: { fieldDefinitions: [{ update: { key: "source", validations: [{ name: "choices", value: JSON.stringify(SOURCES) }] } }] },
+    });
+  }
   if (def.metaobjectDefinitionByType && !keys.has("avatar")) {
     await gql(admin, `mutation($id: ID!, $d: MetaobjectDefinitionUpdateInput!) {
       metaobjectDefinitionUpdate(id: $id, definition: $d) { metaobjectDefinition { id } userErrors { message } } }`, {
@@ -150,7 +160,13 @@ export async function ensureDefinitions(admin: Admin) {
 }
 
 /* ───────────────────────── metaobject <-> review ───────────────────────── */
-function toFields(r: ReviewInput) {
+/** Test reviews (source "Test") never go on the store: always hidden, never pinned or in the banner. */
+function guardTest<T extends { source?: string | null; status: string; featured?: boolean; banner?: boolean }>(r: T): T {
+  return r.source === TEST_SOURCE ? { ...r, status: "hidden", featured: false, banner: false } : r;
+}
+
+function toFields(input: ReviewInput) {
+  const r = guardTest(input);
   const f: { key: string; value: string }[] = [
     { key: "product", value: productGid(r.productId) },
     { key: "rating", value: String(Math.min(5, Math.max(1, Math.round(r.rating)))) },
@@ -195,7 +211,7 @@ function fromMetaobject(shop: string, m: any) {
   const avatar = av?.image?.url ? { id: av.id, url: av.image.url } : null;
   let replies: ReviewComment[] = [];
   try { replies = normalizeComments(JSON.parse(val("replies") || "[]")); } catch { replies = []; }
-  return {
+  const row = {
     id: m.id as string,
     shop,
     productId: productNum(val("product") || ""),
@@ -219,6 +235,8 @@ function fromMetaobject(shop: string, m: any) {
     ...commentState(replies),
     createdAt: new Date(val("created") || m.updatedAt),
   };
+  // a test review edited in Shopify admin still can't reach the store
+  return guardTest(row);
 }
 
 /** needsReply: some thread's latest message is from a customer. lastCommentAt: latest customer message. */
@@ -250,7 +268,7 @@ async function upsertIndex(row: ReturnType<typeof fromMetaobject>) {
 }
 
 /* ───────────────────────── CRUD ───────────────────────── */
-export async function createReview(admin: Admin, shop: string, input: ReviewInput) {
+export async function createReview(admin: Admin, shop: string, input: ReviewInput, opts: { skipSummary?: boolean } = {}) {
   const d = await gql(admin, `mutation($m: MetaobjectCreateInput!) {
     metaobjectCreate(metaobject: $m) { metaobject { ${MO_FIELDS} } userErrors { field message } } }`, {
     m: { type: REVIEW_TYPE, fields: toFields(input) },
@@ -259,7 +277,7 @@ export async function createReview(admin: Admin, shop: string, input: ReviewInpu
   if (errs?.length) throw new Error(errs.map((e: any) => e.message).join(", "));
   const row = fromMetaobject(shop, d.metaobjectCreate.metaobject);
   await upsertIndex(row);
-  await recomputeSummary(admin, shop, row.productId);
+  if (!opts.skipSummary) await recomputeSummary(admin, shop, row.productId);
   return row;
 }
 
@@ -325,7 +343,7 @@ export async function removeFromIndex(admin: Admin, shop: string, id: string) {
 
 /* ───────────────────────── summary metafield ───────────────────────── */
 export async function recomputeSummary(admin: Admin, shop: string, productId: string) {
-  const where = { shop, productId, status: "published" };
+  const where = { shop, productId, status: "published", NOT: { source: TEST_SOURCE } };
   const [agg, groups, photos, top] = await Promise.all([
     prisma.review.aggregate({ where, _avg: { rating: true }, _count: true }),
     prisma.review.groupBy({ by: ["rating"], where, _count: true }),
@@ -385,7 +403,7 @@ async function bannerFor(admin: Admin, shop: string, productId: string) {
   let cfg = { banner_mode: "auto", banner_max: 10, banner_min_rating: 4, banner_shuffle: true };
   try { cfg = await getSettings(admin); } catch { /* defaults */ }
   const rows = await prisma.review.findMany({
-    where: { shop, productId, status: "published" },
+    where: { shop, productId, status: "published", NOT: { source: TEST_SOURCE } },
     orderBy: [{ banner: "desc" }, { featured: "desc" }, { rating: "desc" }, { hasMedia: "desc" }, { createdAt: "desc" }],
     take: 300,
   });
@@ -527,7 +545,7 @@ export async function legacyPage(
   shop: string, productId: string, page: number, customerId = "", votes: VoteList | null = null,
   range: { offset: number; limit: number } | null = null,
 ) {
-  const where = { shop, productId, status: "published" };
+  const where = { shop, productId, status: "published", NOT: { source: TEST_SOURCE } };
   const take = range ? range.limit : page <= 1 ? 250 : 10;
   const skip = range ? range.offset : page <= 1 ? 0 : (page - 1) * 10;
   const [total, rows] = await Promise.all([
@@ -551,7 +569,7 @@ export async function legacyPage(
 /** Every customer photo/video of a product, newest reviews first (the widget's "Customer photos" page). */
 export async function reviewMedia(shop: string, productId: string) {
   const rows = await prisma.review.findMany({
-    where: { shop, productId, status: "published", NOT: { images: "[]" } },
+    where: { shop, productId, status: "published", NOT: [{ images: "[]" }, { source: TEST_SOURCE }] },
     orderBy: [{ featured: "desc" }, { createdAt: "desc" }],
     take: 500,
     select: { id: true, author: true, rating: true, verified: true, body: true, location: true, createdAt: true, images: true, avatar: true },
@@ -963,7 +981,8 @@ function reviewWhere(opts: ReviewFilters) {
   if (opts.media) where.hasMedia = true;
   if (opts.customer || opts.source === "customer") where.source = "Website";
   else if (opts.source === "import") where.source = "Import";
-  else if (opts.source === "dashboard") where.source = { notIn: ["Website", "Import"] };
+  else if (opts.source === "test") where.source = TEST_SOURCE;
+  else if (opts.source === "dashboard") where.source = { notIn: ["Website", "Import", TEST_SOURCE] };
   const and = commentWhere(opts.flagged ? "waiting" : opts.comments);
   if (and.length) where.AND = and;
   const day = (s: string | undefined, end: boolean) =>
